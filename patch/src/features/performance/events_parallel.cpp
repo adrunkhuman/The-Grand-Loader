@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "features/performance/trigger_safety.h"
+#include "features/performance/scope_snapshot.h"
 #include "game/world.h"
 #include "hooks/memory.h"
 #include "log.h"
@@ -93,6 +94,8 @@ alignas(16) unsigned char g_template[kScopeSize];
 // statistics since the last report
 uint64_t g_scans = 0, g_entries = 0, g_chunks = 0, g_served = 0, g_passthrough = 0, g_fires = 0;
 uint64_t g_compared = 0, g_mismatches = 0, g_batch_ticks = 0;
+uint64_t g_requests = 0, g_computed = 0, g_guard_fallbacks = 0;
+uint64_t g_barriers[static_cast<size_t>(trigger_safety::BarrierReason::Count)]{};
 int g_mismatch_logs = 0;
 int64_t g_qpc_freq = 0;
 
@@ -118,19 +121,9 @@ inline char evaluate_original(uintptr_t self, void* scope) {
 
 uintptr_t g_template_origin = 0;  // address of the live scope the template was copied from
 
-// The scope points into itself (CEventScope::ctor sets +0x24, the THIS scope, to the object), so every
-// field of the template that points inside the live scope is moved to the same place in the copy.
+// Rebind a genuine THIS self-reference, retaining external aliases and every scalar seed/ID.
 void fill_scope(unsigned char* scope, const Entry& e) {
-    std::memcpy(scope, g_template, kScopeSize);
-    uintptr_t copy = reinterpret_cast<uintptr_t>(scope);
-    for (size_t off = 0; off < kScopeSize; off += 4) {
-        uint32_t value;
-        std::memcpy(&value, scope + off, 4);
-        if (value >= g_template_origin && value < g_template_origin + kScopeSize) {
-            value = static_cast<uint32_t>(value - g_template_origin + copy);
-            std::memcpy(scope + off, &value, 4);
-        }
-    }
+    scope_snapshot::copy(scope, g_template, g_template_origin);
     if (g_country_pass) {
         std::memcpy(scope + kScopeTag, &e.tag, 4);
         std::memcpy(scope + kScopeCountry, &e.key, 4);
@@ -160,13 +153,18 @@ void evaluate_task(int index, void* context) {
 bool compute_chunk(void* live_scope) {
     int64_t start = qpc();
     auto safety = trigger_safety::Inspector{hooks::exe_base(), read32, read8,
-        reinterpret_cast<uintptr_t>(g_fake_vtable)}.snapshot();
+        reinterpret_cast<uintptr_t>(g_fake_vtable)};
     g_chunk_begin = g_chunk_end = g_next;
     size_t limit = g_next + kChunk < g_seq.size() ? g_next + kChunk : g_seq.size();
-    while (g_chunk_end < limit && safety.pure_tree(g_seq[g_chunk_end].self)) {
+    while (g_chunk_end < limit) {
+        safety = safety.certify_for(g_seq[g_chunk_end].self);
+        if (!safety.pure_tree(g_seq[g_chunk_end].self)) {
+            break;
+        }
         g_seq[g_chunk_end++].result = 2; // no result until a certified worker finishes it
     }
     if (g_chunk_end == g_next) {
+        ++g_barriers[static_cast<size_t>(safety.barrier_reason(g_seq[g_next].self))];
         return false;
     }
     std::memcpy(g_template, live_scope, kScopeSize);
@@ -175,6 +173,7 @@ bool compute_chunk(void* live_scope) {
     parallel::run(tasks, &evaluate_task, &safety);
     g_ready_end = g_chunk_end;
     g_chunks++;
+    g_computed += g_chunk_end - g_chunk_begin;
     g_batch_ticks += static_cast<uint64_t>(qpc() - start);
     return true;
 }
@@ -192,6 +191,7 @@ char __fastcall evaluate_hook(void* self, void*, void* scope) {
     if (!g_in_scan || g_fire_depth > 0 || g_native_depth > 0) {
         return g_original_evaluate(self, nullptr, scope);
     }
+    g_requests++;
     uintptr_t s = reinterpret_cast<uintptr_t>(self);
     uint32_t key = read32(reinterpret_cast<uintptr_t>(scope) + (g_country_pass ? kScopeCountry : kScopeProvince));
     if (g_next >= g_seq.size() || g_seq[g_next].self != s || g_seq[g_next].key != key) {
@@ -218,6 +218,7 @@ char __fastcall evaluate_hook(void* self, void*, void* scope) {
     }
     char result = static_cast<char>(g_seq[g_next++].result);
     if (result == 2) {
+        g_guard_fallbacks++;
         return evaluate_serial(s, scope);
     }
     if (g_mode == 2) {
@@ -330,10 +331,18 @@ void __cdecl scan_end() {
          "%llu events fired, batches %.2f ms/day (%d workers + game thread)",
          kReportEveryScans, ull(g_entries / kReportEveryScans), ull(g_served / kReportEveryScans),
          ull(g_passthrough / kReportEveryScans), ull(g_chunks), ull(g_fires), ms_day, parallel::workers());
+    logf("parallel_events: coverage: %llu/%llu tracked trigger calls served, %llu submitted entries, "
+         "%llu worker guard fallbacks; serial barriers: scope RNG %llu, scope writes %llu, shared writes %llu, "
+         "runtime guards %llu, unclosed %llu", ull(g_served), ull(g_requests), ull(g_computed), ull(g_guard_fallbacks),
+         ull(g_barriers[1]), ull(g_barriers[2]), ull(g_barriers[3]), ull(g_barriers[4]), ull(g_barriers[5]));
     if (g_mode == 2) {
         logf("parallel_events: shadow: %llu compared, %llu mismatches", ull(g_compared), ull(g_mismatches));
     }
     g_entries = g_served = g_passthrough = g_chunks = g_fires = g_compared = g_mismatches = g_batch_ticks = 0;
+    g_requests = g_computed = g_guard_fallbacks = 0;
+    for (auto& count : g_barriers) {
+        count = 0;
+    }
 }
 
 void __cdecl fire_done() {

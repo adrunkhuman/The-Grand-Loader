@@ -7,10 +7,12 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <iterator>
 #include <string>
 #include <vector>
 
 #include "features/performance/trigger_safety.h"
+#include "features/performance/scope_snapshot.h"
 #include "hooks/hourly_tick.h"
 #include "game/world.h"
 #include "hooks/memory.h"
@@ -28,13 +30,13 @@
 //   0x00875040 at 0x0085D34F / 0x0085D459, ESI = AI object, +0x0C index) but runs for a few countries
 //   a day only. The player's alert (FUN_005399C0) and the UI read the global too; they are left alone.
 //
-// cull_decision_checks supplies a private manager only for AI_DecisionUpdate. Leading tag/AI/flag
-// gates may remove a decision only before an unsupported child; a retained unsafe decision ends
-// speculative work for both lists. Lists are rebuilt immediately before the native call, never
-// cached across countries, commands or flag/controller changes. Diplomacy and UI loops stay native.
+// cull_decision_checks rejects failing deterministic leading gates at their native evaluation point.
+// parallel_decisions consumes read-only potential runs in native B-then-A order, resuming after
+// serial barriers. A true potential invalidates later results before native allow/ai_will_do.
+// No private manager or cross-country eligibility cache; diplomacy and UI stay native.
 //
-// decision_profiling swaps the vtable pointer of every decision's `potential` (a CAndTrigger embedded
-// at CDecision+0x24) for a private copy whose Evaluate slot times the call; off, nothing is swapped.
+// A private potential vtable dispatches live AI checks; other consumers pass through. Optional
+// decision_profiling times that dispatch. No decision object or manager list is removed/reordered.
 
 namespace cp::features {
 
@@ -44,8 +46,6 @@ namespace {
 constexpr uint32_t kDecisionManagerPtrRva = 0xF19730;    // DAT_01319730; lists at +0xC/+0x10 and +0x28/+0x2C
 constexpr uint32_t kAiDecisionsRva = 0x421190;            // AI_DecisionUpdate(ai): the daily per-country loop (frame-driven)
 constexpr uint32_t kAiDecisionsCallSiteRva = 0x41EA9B;    // in FUN_0081E9E0, `MOV ECX,ESI; CALL`; ESI = AI object
-constexpr uint32_t kAiObjectCountryIndex = 0x34;          // AI object: +0x30 tag, +0x34 country index
-constexpr uint32_t kScopeCtorRva = 0x4A8650;             // CEventScope::ctor(this, parent = 0)
 constexpr uint32_t kAndVtableRva = 0x9F9994;             // CAndTrigger::vftable
 constexpr uint32_t kNotVtableRva = 0xA2FBA8;             // CNotTrigger::vftable
 constexpr uint32_t kTagVtableRva = 0xA30C80;             // CTagTrigger::vftable (+0x1C tag, +0x20 country index)
@@ -53,7 +53,6 @@ constexpr uint32_t kHasCountryFlagVtableRva = 0xA307E8;  // CHasCountryFlagTrigg
 constexpr uint32_t kHasGlobalFlagVtableRva = 0xA30820;   // CHasGlobalFlagTrigger::vftable
 constexpr uint32_t kIsAiVtableRva = 0xA30EE8;            // CIsAiTrigger::vftable (`ai = yes/no`, value at +0x1C)
 
-constexpr uint32_t kManagerSize = 0x38;       // DecisionManager_Get allocates 0x38 bytes
 constexpr uint32_t kListA = 0x0C;             // vector<CDecision*>: begin +0, end +4, capacity +8
 constexpr uint32_t kListB = 0x28;
 constexpr uint32_t kDecisionName = 0x08;      // std::string (SSO): buffer/pointer +0x08, size +0x18, capacity +0x1C
@@ -64,8 +63,6 @@ constexpr uint32_t kTriggerThisFlag = 0x18;   // value was `THIS`
 constexpr uint32_t kTriggerFromFlag = 0x19;   // value was `FROM`
 constexpr uint32_t kTagTriggerIndex = 0x20;   // CTagTrigger: country index of the literal tag
 constexpr uint32_t kVtableEvaluate = 0x18;    // CTrigger slot 6: bool Evaluate(scope)
-constexpr uint32_t kScopeTag = 0x08;          // CEventScope: country tag
-constexpr size_t kScopeSize = 0x60;
 constexpr size_t kVtableSlotsCopied = 16;     // CAndTrigger has 12 used slots; extra entries are never called
 
 constexpr int32_t kReportEveryDays = 30;  // profiling report period
@@ -73,13 +70,11 @@ constexpr uint64_t kSample = 16;          // profiling: 1 in 16 evaluations is t
 
 // __thiscall in the game; __fastcall takes `this` in ecx and ignores edx.
 using EvaluateFn = char(__fastcall*)(void* self, void* edx, void* scope);
-using ScopeCtorFn = void*(__fastcall*)(void* self, void* edx, void* parent);
 
 bool g_cull = false;
 bool g_profiling = false;
 EvaluateFn g_original_evaluate = nullptr;
-ScopeCtorFn g_scope_ctor = nullptr;
-uintptr_t g_fake_vtable[kVtableSlotsCopied];
+uint32_t g_fake_vtable[kVtableSlotsCopied];
 uintptr_t g_and_vtable = 0;
 uintptr_t g_not_vtable = 0;
 uintptr_t g_tag_vtable = 0;
@@ -111,22 +106,14 @@ struct LookupSlot {
 std::vector<LookupSlot> g_lookup;
 uint32_t g_lookup_shift = 32;
 
-// Scratch storage only: no evaluation or classification survives a native AI update.
-struct CountryLists {
-    std::vector<uintptr_t> a;
-    std::vector<uintptr_t> b;
-};
-CountryLists g_lists;
-alignas(16) uint8_t g_fake_manager[kManagerSize];
-
 // cull statistics since load (exact)
 uint64_t g_list_builds = 0;
 uint64_t g_list_build_ticks = 0;
-uint64_t g_removed_tag = 0;   // decisions left out of a list, summed over builds
+uint64_t g_removed_tag = 0;   // live potential rejections by leading gates
 uint64_t g_removed_ai = 0;
 uint64_t g_removed_dead = 0;
-uint64_t g_ai_requests = 0;   // getter calls served with a filtered list
-uint64_t g_ai_decisions_seen = 0;  // list entries handed to the AI loop, summed over requests
+uint64_t g_ai_requests = 0;   // native daily AI updates
+uint64_t g_ai_decisions_seen = 0;  // tracked native potential calls
 
 // profiling totals since load
 uint64_t g_total_calls = 0;  // exact: evaluations that went through the timed hook
@@ -191,7 +178,7 @@ bool block_is_only_flag_checks(uintptr_t block) {
     return true;
 }
 
-void classify(DecisionInfo& info, const trigger_safety::Inspector& safety) {
+void classify(DecisionInfo& info, trigger_safety::Inspector safety, uint32_t country = UINT32_MAX) {
     uintptr_t block = info.decision + kDecisionPotential;
     uintptr_t vtable = read32(block);
     uintptr_t begin = read32(block + kBlockBegin), end = read32(block + kBlockEnd);
@@ -204,6 +191,7 @@ void classify(DecisionInfo& info, const trigger_safety::Inspector& safety) {
     }
     for (uintptr_t it = begin; it < end; it += 4) {
         uintptr_t child = read32(it);
+        safety = safety.certify_for(child);
         if (!safety.pure_tree(child)) {
             break;  // NEVER search past an impure/unsupported child for a later gate
         }
@@ -211,6 +199,9 @@ void classify(DecisionInfo& info, const trigger_safety::Inspector& safety) {
         if (vtable == g_tag_vtable && info.locked_country < 0 && read8(child + kTriggerThisFlag) == 0 &&
             read8(child + kTriggerFromFlag) == 0) {
             info.locked_country = static_cast<int32_t>(read32(child + kTagTriggerIndex));
+            if (country != UINT32_MAX && static_cast<uint32_t>(info.locked_country) != country) {
+                return; // no need to certify later flag domains after a known failing tag
+            }
         } else if (vtable == g_not_vtable && info.gate == 0 && block_is_only_flag_checks(child)) {
             info.gate = child;
         } else if (vtable == g_is_ai_vtable && info.ai_child == 0 && read8(child + kTriggerThisFlag) == 0) {
@@ -219,248 +210,222 @@ void classify(DecisionInfo& info, const trigger_safety::Inspector& safety) {
     }
 }
 
-// --- just-in-time lists and parallel prefix -------------------------------------------------------
+// --- live short-circuit culling and worker runs --------------------------------------------------
 
-constexpr uint32_t kAiObjectTag = 0x30;
-constexpr uint32_t kDecisionAllow = 0x40;
-constexpr uint32_t kDecisionCheckTrivialRva = 0x631490;  // MOV AL,1 / RET
-constexpr uintptr_t kAiScopeParent = 0x2D;
 constexpr int kMaxMismatchLogs = 20;
-
+constexpr size_t kChunk = 1024;
+constexpr int kPerTask = 16;
 int g_parallel = 0;  // 0 off, 1 on, 2 shadow
 bool g_frame_open = false;
-uintptr_t g_decision_check_trivial = 0;
+bool g_in_ai = false;
+DWORD g_ai_thread = 0;
+int g_native_depth = 0;
 
-struct PrefixCheck {
+struct PotentialCheck {
     uintptr_t decision;
     int result = -1;
 };
-std::vector<PrefixCheck> g_checks;
+std::vector<PotentialCheck> g_checks;
+size_t g_next = 0, g_ready_end = 0;
+alignas(16) unsigned char g_template[scope_snapshot::size];
+uintptr_t g_template_origin = 0;
 
-struct WorkerContext {
-    const uintptr_t ai;
-    const trigger_safety::Inspector safety;
-};
-
-// parallel statistics since load
-uint64_t g_par_frames = 0;     // per-country batches, not frame-wide prefetches
-uint64_t g_par_countries = 0;
-uint64_t g_par_ticks = 0;
-uint64_t g_par_checked = 0;
-uint64_t g_par_passed = 0;
-uint64_t g_par_used = 0;
-uint64_t g_shadow_compared = 0;
-uint64_t g_shadow_mismatches = 0;
+uint64_t g_par_frames = 0, g_par_countries = 0, g_par_ticks = 0;
+uint64_t g_par_checked = 0, g_par_passed = 0, g_par_used = 0;
+uint64_t g_shadow_compared = 0, g_shadow_mismatches = 0;
+uint64_t g_native_checks = 0, g_gate_checks = 0, g_guard_fallbacks = 0;
+uint64_t g_barriers[static_cast<size_t>(trigger_safety::BarrierReason::Count)]{};
 int g_mismatch_logs = 0;
 
 trigger_safety::Inspector inspector() {
     return {hooks::exe_base(), read32, read8, reinterpret_cast<uintptr_t>(g_fake_vtable)};
 }
 
-void make_ai_scope(unsigned char* scope, uintptr_t ai) {
-    std::memset(scope, 0, kScopeSize);
-    g_scope_ctor(scope, nullptr, reinterpret_cast<void*>(kAiScopeParent));
-    std::memcpy(scope + kScopeTag, reinterpret_cast<const void*>(ai + kAiObjectTag), 8);
-    // Construct in place: THIS (+0x24) must point to this scope, not a copied main-thread scope.
-}
-
-// Do not call slot 6, ai_will_do or CRT rand on workers.
-int decision_passes(uintptr_t decision, void* scope) {
-    if (read32(read32(decision) + kVtableEvaluate) != g_decision_check_trivial) {
-        return -1;
+bool prepare_country(uintptr_t manager) {
+    g_checks.clear();
+    g_next = g_ready_end = 0;
+    if (!manager) {
+        return false;
     }
-    return evaluate(decision + kDecisionPotential, scope) && evaluate(decision + kDecisionAllow, scope) ? 1 : 0;
-}
-
-void set_fake_list(uint32_t offset, const std::vector<uintptr_t>& list) {
-    uintptr_t begin = list.empty() ? 0 : reinterpret_cast<uintptr_t>(list.data());
-    uintptr_t end = begin + list.size() * sizeof(uintptr_t);
-    *reinterpret_cast<uintptr_t*>(g_fake_manager + offset) = begin;
-    *reinterpret_cast<uintptr_t*>(g_fake_manager + offset + 4) = end;
-    *reinterpret_cast<uintptr_t*>(g_fake_manager + offset + 8) = end;
-}
-
-bool copy_lists(uintptr_t manager) {
+    // Do not replace the global manager. Native slot checks, order and loop control remain intact.
     for (uint32_t offset : {kListB, kListA}) {
         uintptr_t begin = read32(manager + offset), end = read32(manager + offset + 4);
         if (!trigger_safety::Inspector::valid_range(begin, end)) {
+            g_checks.clear();
             return false;
         }
-        auto& out = offset == kListB ? g_lists.b : g_lists.a;
-        out.clear();
         for (uintptr_t it = begin; it < end; it += 4) {
-            out.push_back(read32(it));
+            uintptr_t decision = read32(it);
+            if (!decision) {
+                g_checks.clear();
+                return false;
+            }
+            g_checks.push_back({decision, -1});
+        }
+    }
+    for (const PotentialCheck& check : g_checks) {
+        uintptr_t potential = check.decision + kDecisionPotential;
+        if (read32(potential) == g_and_vtable) {
+            *reinterpret_cast<uint32_t*>(potential) = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(g_fake_vtable));
         }
     }
     return true;
 }
 
-// Only the retained B-then-A pure prefix is eligible. Leading-gate culling may already have
-// removed unreachable unsafe tails; the first remaining unsafe B still leaves ALL A untouched.
-void collect_prefix(const trigger_safety::Inspector& safety) {
-    g_checks.clear();
-    for (const auto* list : {&g_lists.b, &g_lists.a}) {
-        for (uintptr_t decision : *list) {
-            if (!safety.decision_parallel_safe(decision)) {
-                return;
-            }
-            g_checks.push_back({decision, -1});
-        }
-    }
+// Native slot 6 runs before potential, twice. Unknown implementations are barriers even if they
+// eventually skip that entry; they might mutate state without ever calling our potential hook.
+bool potential_parallel_safe(uintptr_t decision, const trigger_safety::Inspector& safety) {
+    return safety.decision_potential_safe(decision);
 }
 
-// One decision per task, no allocation and no future-country work. The main thread has checked
-// the ctor singleton and all guards; the world remains frozen until parallel::run returns.
-void precompute_decision(int index, void* context) {
+struct WorkerContext {
+    size_t begin, end;
+    const trigger_safety::Inspector safety;
+};
+
+void precompute_decisions(int index, void* context) {
     const auto& work = *static_cast<const WorkerContext*>(context);
-    PrefixCheck& check = g_checks[static_cast<size_t>(index)];
-    if (!work.safety.decision_parallel_safe(check.decision)) {
-        return;
+    size_t begin = work.begin + static_cast<size_t>(index) * kPerTask;
+    size_t end = std::min(begin + kPerTask, work.end);
+    alignas(16) unsigned char scope[scope_snapshot::size];
+    for (size_t i = begin; i < end; ++i) {
+        PotentialCheck& check = g_checks[i];
+        if (!potential_parallel_safe(check.decision, work.safety)) {
+            continue;  // guard must hold on the actual execution thread
+        }
+        scope_snapshot::copy(scope, g_template, g_template_origin);
+        check.result = g_original_evaluate(reinterpret_cast<void*>(check.decision + kDecisionPotential),
+                                           nullptr, scope) ? 1 : 0;
     }
-    alignas(16) unsigned char scope[kScopeSize];
-    make_ai_scope(scope, work.ai);
-    check.result = decision_passes(check.decision, scope);
 }
 
-void shadow_compare(uintptr_t ai, const trigger_safety::Inspector& safety) {
-    // Never run the unsafe suffix, even for diagnostics.
-    alignas(16) unsigned char scope[kScopeSize];
-    make_ai_scope(scope, ai);
-    for (const PrefixCheck& check : g_checks) {
-        if (!safety.decision_parallel_safe(check.decision)) {
+bool compute_run(void* live_scope, trigger_safety::Inspector safety) {
+    size_t end = g_next, limit = std::min(g_next + kChunk, g_checks.size());
+    while (end < limit) {
+        safety = safety.certify_for(g_checks[end].decision + kDecisionPotential);
+        if (!potential_parallel_safe(g_checks[end].decision, safety)) {
             break;
         }
-        int serial = decision_passes(check.decision, scope);
-        g_shadow_compared++;
-        if (serial != check.result) {
-            g_shadow_mismatches++;
-            if (g_mismatch_logs++ < kMaxMismatchLogs) {
-                logf("parallel_decisions: MISMATCH day %d country %u %s: serial %d, parallel %d",
-                     current_day(), read32(ai + kAiObjectCountryIndex),
-                     decision_name(check.decision).c_str(), serial, check.result);
-            }
-        }
+        g_checks[end++].result = -1;
     }
-}
-
-void compact_prefix() {
-    // An unexpected runtime guard/slot failure invalidates the batch, rather than using results
-    // from beyond that new barrier. No trigger was evaluated by the failing task.
-    for (const PrefixCheck& check : g_checks) {
-        if (check.result < 0) {
-            return;
-        }
+    if (end == g_next) {
+        return false;
     }
-    size_t at = 0;
-    for (auto* list : {&g_lists.b, &g_lists.a}) {
-        size_t out = 0;
-        for (uintptr_t decision : *list) {
-            if (at >= g_checks.size() || g_checks[at].result != 0) {
-                (*list)[out++] = decision;
-            }
-            at++;
-        }
-        list->resize(out);
-    }
-}
-
-void cull_leading_gates(uintptr_t ai, const trigger_safety::Inspector& safety) {
-    alignas(16) unsigned char scope[kScopeSize];
-    make_ai_scope(scope, ai);
-    bool barrier = false;
-    for (auto* list : {&g_lists.b, &g_lists.a}) {
-        size_t out = 0;
-        for (uintptr_t decision : *list) {
-            if (!barrier) {
-                DecisionInfo info;
-                info.decision = decision;
-                // Reclassify now: earlier child/locale/receiver guards cannot be cached at load.
-                classify(info, safety);
-                if (info.locked_country >= 0 &&
-                    static_cast<uint32_t>(info.locked_country) != read32(ai + kAiObjectCountryIndex)) {
-                    g_removed_tag++;
-                    continue;
-                }
-                if (info.ai_child && !evaluate(info.ai_child, scope)) {
-                    g_removed_ai++;
-                    continue;
-                }
-                if (info.gate && !evaluate(info.gate, scope)) {
-                    g_removed_dead++;
-                    continue;
-                }
-                // A failed leading gate means native never reaches the unsafe tail. Otherwise
-                // retained potential/allow/AI modifiers may mutate state: do not pre-cull later gates.
-                barrier = !safety.decision_parallel_safe(decision);
-            }
-            (*list)[out++] = decision;
-        }
-        list->resize(out);
-    }
-}
-
-uintptr_t manager_for_ai(uintptr_t ai, uintptr_t real) {
-    if (!real || current_day() < 0) {
-        return real;
-    }
+    std::memcpy(g_template, live_scope, scope_snapshot::size);
+    g_template_origin = reinterpret_cast<uintptr_t>(live_scope);
+    WorkerContext context{g_next, end, safety};
     int64_t start = qpc();
-    if (!copy_lists(real)) {
-        return real;
+    parallel::run(static_cast<int>((end - g_next + kPerTask - 1) / kPerTask), &precompute_decisions, &context);
+    g_par_ticks += static_cast<uint64_t>(qpc() - start);
+    g_ready_end = end;
+    g_par_frames++;
+    g_par_checked += end - g_next;
+    return true;
+}
+
+char native_potential(void* self, void* scope) {
+    g_native_depth++;
+    char result = g_original_evaluate(self, nullptr, scope);
+    g_native_depth--;
+    return result;
+}
+
+// Only deterministic, read-only leading gates may be inspected out of order. In particular, never
+// evaluate a random condition to decide whether to keep it and then reroll it natively.
+char serial_potential(uintptr_t self, void* scope, const trigger_safety::Inspector& safety) {
+    g_native_checks++;
+    if (g_cull && g_parallel != 2) {
+        DecisionInfo info;
+        info.decision = self - kDecisionPotential;
+        classify(info, safety, read32(reinterpret_cast<uintptr_t>(scope) + 0x0C));
+        bool rejected = false;
+        if (info.locked_country >= 0 && static_cast<uint32_t>(info.locked_country) !=
+                read32(reinterpret_cast<uintptr_t>(scope) + 0x0C)) {
+            g_removed_tag++;
+            rejected = true;
+        } else if (info.ai_child && !evaluate(info.ai_child, scope)) {
+            g_removed_ai++;
+            rejected = true;
+        } else if (info.gate && !evaluate(info.gate, scope)) {
+            g_removed_dead++;
+            rejected = true;
+        }
+        if (rejected) {
+            g_gate_checks++;
+            return 0;
+        }
     }
-    // Certify receiver domains once in this frozen interval, not once per flag leaf. This
-    // snapshot and its worker copy die before native AI work; numeric guards remain per-thread.
-    const auto safety = inspector().snapshot();
-    if (!safety.scope_constructor_safe()) {
-        return real;  // speculative scope construction must not perform shared initialization
+    if (g_parallel) {
+        ++g_barriers[static_cast<size_t>(safety.barrier_reason(self))];
     }
-    if (g_parallel != 2) {
-        cull_leading_gates(ai, safety);
+    return native_potential(reinterpret_cast<void*>(self), scope);
+}
+
+char live_potential(uintptr_t self, void* scope) {
+    if (!g_in_ai || g_native_depth) {
+        return native_potential(reinterpret_cast<void*>(self), scope);
+    }
+    g_ai_decisions_seen++;
+    if (g_next >= g_checks.size() || g_checks[g_next].decision + kDecisionPotential != self) {
+        // A skipped custom slot or changed list may have mutated state. Never use results across it.
+        g_ready_end = g_next;
+        while (g_next < g_checks.size() && g_checks[g_next].decision + kDecisionPotential != self) {
+            ++g_next;
+        }
+        if (g_next == g_checks.size()) {
+            g_in_ai = false;
+            return native_potential(reinterpret_cast<void*>(self), scope);
+        }
     }
     if (g_parallel && g_frame_open) {
-        collect_prefix(safety);
-        if (!g_checks.empty()) {
-            // In-place construction on the main thread also establishes the exact native scope
-            // before any worker ctor. No singleton initialization is permitted above or below.
-            alignas(16) unsigned char scope[kScopeSize];
-            make_ai_scope(scope, ai);
-            // The pool copies the caller's exact x87 control word and MXCSR, including on its
-            // single-thread fallback. Worker-side Inspector checks see that same numeric state.
-            WorkerContext context{ai, safety};  // immutable copy, alive until every task completes
-            parallel::run(static_cast<int>(g_checks.size()), &precompute_decision, &context);
-            g_par_frames++;
-            g_par_countries++;
-            g_par_checked += g_checks.size();
-            for (const PrefixCheck& check : g_checks) {
-                g_par_passed += check.result == 1 ? 1 : 0;
+        if (g_next >= g_ready_end) {
+            const auto safety = inspector();
+            if (!compute_run(scope, safety)) {
+                ++g_next;
+                g_ready_end = g_next;
+                return serial_potential(self, scope, safety);
             }
-            if (g_parallel == 2) {
-                shadow_compare(ai, safety);
-            } else {
-                compact_prefix();
-            }
-            g_par_used++;
         }
-        g_par_ticks += static_cast<uint64_t>(qpc() - start);
+        if (g_next < g_ready_end) {
+            int result = g_checks[g_next++].result;
+            if (result >= 0) {
+                g_par_passed += result ? 1 : 0;
+                if (g_parallel == 2) {
+                    char serial = native_potential(reinterpret_cast<void*>(self), scope) ? 1 : 0;
+                    g_shadow_compared++;
+                    if (serial != result) {
+                        g_shadow_mismatches++;
+                        if (g_mismatch_logs++ < kMaxMismatchLogs) {
+                            logf("parallel_decisions: MISMATCH day %d %s: serial %d, parallel %d", current_day(),
+                                 decision_name(self - kDecisionPotential).c_str(), serial, result);
+                        }
+                    }
+                    if (serial || serial != result) {
+                        g_ready_end = g_next;
+                    }
+                    return serial;
+                }
+                g_par_used++;
+                if (result) {
+                    // Native allow and ai_will_do follow. They need no purity certificate because
+                    // they stay serial, but may change the world/scope before the next potential.
+                    g_ready_end = g_next;
+                }
+                return static_cast<char>(result);
+            }
+            g_guard_fallbacks++;
+        } else {
+            ++g_next;
+        }
+    } else {
+        ++g_next;
     }
-    g_list_builds++;
-    g_list_build_ticks += static_cast<uint64_t>(qpc() - start);
-    g_ai_requests++;
-    g_ai_decisions_seen += g_lists.a.size() + g_lists.b.size();
-    if (g_parallel == 2 ||
-        (g_lists.a.size() == (read32(real + kListA + 4) - read32(real + kListA)) / 4 &&
-         g_lists.b.size() == (read32(real + kListB + 4) - read32(real + kListB)) / 4)) {
-        return real;  // shadow and unchanged lists use the original manager too
-    }
-    std::memcpy(g_fake_manager, reinterpret_cast<const void*>(real), kManagerSize);
-    set_fake_list(kListA, g_lists.a);
-    set_fake_list(kListB, g_lists.b);
-    return reinterpret_cast<uintptr_t>(g_fake_manager);
+    g_ready_end = g_next;
+    const auto safety = inspector();
+    return serial_potential(self, scope, safety);
 }
 
-void frame_begin(void* queue_ref) {
-    // Preserve fast_ai_queue's lifecycle API, but never snapshot later countries here.
-    g_frame_open = g_parallel && queue_ref;
-}
+void frame_begin(void* queue_ref) { g_frame_open = g_parallel && queue_ref; }
 void frame_end() { g_frame_open = false; }
 
 void log_parallel_summary(int32_t last_day) {
@@ -469,40 +434,60 @@ void log_parallel_summary(int32_t last_day) {
         return;
     }
     auto ull = [](uint64_t v) { return static_cast<unsigned long long>(v); };
-    logf("parallel_decisions: days %d-%d: %llu batches, %.0f countries and %.0f checks per batch, %.2f ms/day on the game "
-         "thread (%d workers + game thread), %llu passed/day, %llu AI updates served",
-         g_first_day, last_day, ull(g_par_frames), static_cast<double>(g_par_countries) / g_par_frames,
+    logf("parallel_decisions: days %d-%d: %llu AI updates, %llu batches, %.0f potentials/batch, %.2f ms/day batching "
+         "(%d workers + game thread); %llu/%llu reached potentials served, %llu worker guard fallbacks",
+         g_first_day, last_day, ull(g_par_countries), ull(g_par_frames),
          static_cast<double>(g_par_checked) / g_par_frames, ms(g_par_ticks) / days, parallel::workers(),
-         ull(g_par_passed / days), ull(g_par_used));
+         ull(g_par_used), ull(g_ai_decisions_seen), ull(g_guard_fallbacks));
+    logf("parallel_decisions: serial barriers: scope RNG %llu, scope writes %llu, shared writes %llu, "
+         "runtime guards %llu, unclosed %llu", ull(g_barriers[1]), ull(g_barriers[2]), ull(g_barriers[3]),
+         ull(g_barriers[4]), ull(g_barriers[5]));
     if (g_parallel == 2) {
         logf("parallel_decisions: shadow: %llu checks compared, %llu mismatches", ull(g_shadow_compared),
              ull(g_shadow_mismatches));
     }
 }
 
-// AI_DecisionUpdate reads the manager through the global, so the global itself is pointed at the
-// country's copy for the duration of the call and restored afterwards, also on an unwind.
+// Native keeps its own manager, scopes, slot calls, chance rolls and command handling.
 using AiDecisionsFn = int(__fastcall*)(void* ai, void* edx);
 AiDecisionsFn g_original_ai_decisions = nullptr;
 
 int __fastcall ai_decisions_hook(void* ai, void* edx) {
-    uintptr_t* global = reinterpret_cast<uintptr_t*>(hooks::exe_addr(kDecisionManagerPtrRva));
-    uintptr_t real = *global;
-    uintptr_t replacement = manager_for_ai(reinterpret_cast<uintptr_t>(ai), real);
-    if (replacement == real) {
+    if (g_in_ai) {
+        // Re-entrant native AI work must not consume the outer country's cursor or results.
+        g_ready_end = g_next;
+        g_native_depth++;
+        int nested = 0;
+        __try {
+            nested = g_original_ai_decisions(ai, edx);
+        } __finally {
+            g_native_depth--;
+        }
+        return nested;
+    }
+    if (current_day() < 0) {
         return g_original_ai_decisions(ai, edx);
     }
+    int64_t start = qpc();
+    bool ready = prepare_country(decision_manager());
+    g_list_builds++;
+    g_list_build_ticks += static_cast<uint64_t>(qpc() - start);
+    g_ai_requests++;
+    g_par_countries++;
+    g_ai_thread = GetCurrentThreadId();
+    g_in_ai = ready;
     int result = 0;
-    *global = replacement;
     __try {
         result = g_original_ai_decisions(ai, edx);
     } __finally {
-        *global = real;
+        g_in_ai = false;
+        g_next = g_ready_end = 0;
+        g_native_depth = 0;
     }
     return result;
 }
 
-// --- profiling hook (only installed with decision_profiling) ---------------------------------------
+// --- potential dispatch and optional profiling ---------------------------------------
 
 inline uint32_t lookup_hash(uintptr_t key) {
     return static_cast<uint32_t>((key >> 2) * 0x9E3779B1u) >> g_lookup_shift;
@@ -544,13 +529,16 @@ inline DecisionInfo* lookup(uintptr_t key) {
 }
 
 char __fastcall potential_hook(void* self, void*, void* scope) {
-    g_total_calls++;
-    bool sampled = (g_sample_counter++ & (kSample - 1)) == 0;
-    if (!sampled) {
+    if (g_in_ai && GetCurrentThreadId() != g_ai_thread) {
         return g_original_evaluate(self, nullptr, scope);
     }
+    g_total_calls++;
+    bool sampled = g_profiling && (g_sample_counter++ & (kSample - 1)) == 0;
+    if (!sampled) {
+        return live_potential(reinterpret_cast<uintptr_t>(self), scope);
+    }
     int64_t start = qpc();
-    char result = g_original_evaluate(self, nullptr, scope);
+    char result = live_potential(reinterpret_cast<uintptr_t>(self), scope);
     uint64_t ticks = static_cast<uint64_t>(qpc() - start);
     if (DecisionInfo* info = lookup(reinterpret_cast<uintptr_t>(self))) {
         info->ticks += ticks;
@@ -569,8 +557,8 @@ void log_cull_summary(int32_t last_day) {
     }
     auto ull = [](uint64_t v) { return static_cast<unsigned long long>(v); };
     double per_request = static_cast<double>(g_ai_decisions_seen) / static_cast<double>(g_ai_requests);
-    logf("decision_cull: days %d-%d: AI loop saw %.0f of %zu decisions per country on average (%llu list requests/day); "
-         "%llu list builds (%.2f ms/day) left out %llu by tag, %llu by ai, %llu dead per build",
+    logf("decision_cull: days %d-%d: %.0f/%zu potentials reached per AI update (%llu updates/day); "
+         "%llu sequence builds (%.2f ms/day), live rejections/update: %llu tag, %llu ai, %llu flag",
          g_first_day, last_day, per_request, g_decisions.size(), ull(g_ai_requests / days),
          ull(g_list_builds), ms(g_list_build_ticks) / days,
          ull(g_list_builds ? g_removed_tag / g_list_builds : 0), ull(g_list_builds ? g_removed_ai / g_list_builds : 0),
@@ -582,9 +570,8 @@ void write_report(int32_t last_day) {
     if (g_first_day < 0 || days <= 0 || g_decisions.empty()) {
         return;
     }
-    uint64_t calls = 0, passed = 0, ticks = 0;
+    uint64_t passed = 0, ticks = 0;
     for (const DecisionInfo& d : g_decisions) {
-        calls += d.calls;
         passed += d.passed;
         ticks += d.ticks;
     }
@@ -611,8 +598,8 @@ void write_report(int32_t last_day) {
             g_ai_gated);
     if (g_cull && g_ai_requests && g_list_builds) {
         fprintf(out,
-                "# cull: AI loop saw %.0f decisions per country on average; list builds left out %llu by tag, %llu by ai, "
-                "%llu dead per build (%llu builds, %.2f ms/day)\n",
+                "# cull: %.0f potentials reached/update; live rejections/update: %llu tag, %llu ai, "
+                "%llu flag (%llu sequence builds, %.2f ms/day)\n",
                 static_cast<double>(g_ai_decisions_seen) / static_cast<double>(g_ai_requests),
                 ull(g_removed_tag / g_list_builds), ull(g_removed_ai / g_list_builds), ull(g_removed_dead / g_list_builds),
                 ull(g_list_builds), ms(g_list_build_ticks) / days);
@@ -645,7 +632,7 @@ uintptr_t list_begin(uintptr_t manager, uint32_t list) { return read32(manager +
 uintptr_t list_end(uintptr_t manager, uint32_t list) { return read32(manager + list + 4); }
 
 // Re-reads the manager lists for reporting and profiling only. These classifications never
-// authorize culling; the daily hook reads the live lists and guards again.
+// authorize culling; the potential hook rechecks the live scope and guards at consumption.
 void refresh_decisions() {
     uintptr_t manager = decision_manager();
     if (!manager) {
@@ -681,6 +668,8 @@ void refresh_decisions() {
     g_ai_requests = g_ai_decisions_seen = 0;
     g_par_frames = g_par_countries = g_par_ticks = g_par_checked = g_par_passed = g_par_used = 0;
     g_shadow_compared = g_shadow_mismatches = 0;
+    g_native_checks = g_gate_checks = g_guard_fallbacks = 0;
+    std::fill(std::begin(g_barriers), std::end(g_barriers), 0);
     g_checks.clear();
     g_first_day = -1;
     g_period_start_day = -1;
@@ -711,7 +700,7 @@ void refresh_decisions() {
         for (const DecisionInfo& d : g_decisions) {
             uintptr_t potential = d.decision + kDecisionPotential;
             if (read32(potential) == g_and_vtable) {
-                *reinterpret_cast<uintptr_t*>(potential) = reinterpret_cast<uintptr_t>(g_fake_vtable);
+                *reinterpret_cast<uint32_t*>(potential) = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(g_fake_vtable));
             }
         }
     }
@@ -751,7 +740,7 @@ void install_decision_cull(const Config& config) {
     g_profiling = config.decision_profiling;
     g_parallel = config.parallel_decisions;
     if (g_parallel && !g_cull) {
-        logf("parallel_decisions: needs cull_decision_checks = 1 (it extends the cull's per-country lists), off");
+        logf("parallel_decisions: needs cull_decision_checks = 1 (shared potential dispatch), off");
         g_parallel = 0;
     }
     if (g_parallel && g_profiling) {
@@ -762,8 +751,7 @@ void install_decision_cull(const Config& config) {
         logf("parallel_decisions: needs fast_ai_queue = 1 (the batch runs in the frame that drains the AI queue), off");
         g_parallel = 0;
     }
-    g_decision_check_trivial = hooks::exe_addr(kDecisionCheckTrivialRva);
-    if (g_cull && !hooks::expect_bytes(g_decision_check_trivial, "\xB0\x01\xC3", 3)) {
+    if (g_cull && !hooks::expect_bytes(hooks::exe_addr(0x631490), "\xB0\x01\xC3", 3)) {
         logf("decision_cull: CDecision slot 6 not recognised, culling/parallel off");
         g_cull = false;
         g_parallel = 0;
@@ -783,16 +771,14 @@ void install_decision_cull(const Config& config) {
     g_has_country_flag_vtable = hooks::exe_addr(kHasCountryFlagVtableRva);
     g_has_global_flag_vtable = hooks::exe_addr(kHasGlobalFlagVtableRva);
     g_is_ai_vtable = hooks::exe_addr(kIsAiVtableRva);
-    g_scope_ctor = reinterpret_cast<ScopeCtorFn>(hooks::exe_addr(kScopeCtorRva));
     std::memcpy(g_fake_vtable, reinterpret_cast<const void*>(g_and_vtable), sizeof(g_fake_vtable));
     g_original_evaluate = reinterpret_cast<EvaluateFn>(g_fake_vtable[kVtableEvaluate / 4]);
     if (reinterpret_cast<uintptr_t>(g_original_evaluate) != hooks::exe_addr(0x4B8260) ||
-        !hooks::expect_bytes(reinterpret_cast<uintptr_t>(g_original_evaluate), "\x55\x8B\xEC", 3) ||
-        !hooks::expect_bytes(reinterpret_cast<uintptr_t>(g_scope_ctor), "\x55\x8B\xEC", 3)) {
-        logf("decision_cull: CAndTrigger::Evaluate / CEventScope ctor not recognised, feature off");
+        !hooks::expect_bytes(reinterpret_cast<uintptr_t>(g_original_evaluate), "\x55\x8B\xEC", 3)) {
+        logf("decision_cull: CAndTrigger::Evaluate not recognised, feature off");
         return;
     }
-    g_fake_vtable[kVtableEvaluate / 4] = reinterpret_cast<uintptr_t>(&potential_hook);
+    g_fake_vtable[kVtableEvaluate / 4] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&potential_hook));
 
     if (g_cull) {
         uintptr_t ai_decisions = hooks::exe_addr(kAiDecisionsRva);
@@ -812,10 +798,10 @@ void install_decision_cull(const Config& config) {
         logf("decision_cull: hourly tick hook unavailable, feature off");
         return;
     }
-    logf("decision_cull: active (cull %s: just-in-time daily AI lists, leading gates until an unsafe barrier; profiling %s)",
+    logf("decision_cull: active (cull %s: live leading gates, no filtered manager; profiling %s)",
          g_cull ? "on" : "off", g_profiling ? "on" : "off");
     if (g_parallel) {
-        logf("parallel_decisions: active (%s): per-country B-then-A pure prefix, including ai_will_do modifiers",
+        logf("parallel_decisions: active (%s): live potential runs; native allow, ai_will_do and RNG",
              g_parallel == 2 ? "shadow mode, the game still uses its own evaluation" : "results used");
     }
 }

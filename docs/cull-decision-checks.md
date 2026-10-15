@@ -6,25 +6,22 @@
 
 ## Why
 
-Once per AI country per day, `AI_DecisionUpdate` (`0x00821190`) evaluates the `potential` of every decision
-(TGC: 1651 decisions × ~320 countries ≈ 529 k evaluations a day, ~12 % of the day). Many of them are
-false before they start:
-
-- a decision with a top-level `tag = X`, evaluated for a country other than X (~213 k a day);
-- a decision with a top-level `ai = no`, evaluated for an AI country.
-
-A hook on each evaluation cannot win: the evaluations cost tens of nanoseconds, about as much as the hook.
-The work has to disappear from the loop.
+Most AI decision potentials fail. A leading `tag = USA` can rule out a decision for France without
+running later conditions, even if those later conditions are too complex or stateful to speculate.
+A failed earlier decision can also change the shared scope or world: filtering an entire country's
+list in advance can therefore make later eligibility stale.
 
 ## How
 
-- Immediately before `AI_DecisionUpdate` (`0x0081EA9B`), build private lists in native B-then-A order
-  and point the global manager `DAT_01319730` at that copy for the call. No filtered list survives
-  another AI update, command or flag/controller change. Diplomacy, player alerts and UI stay native.
-- A standard-slot-6 decision may be removed by a failing leading literal tag, AI or flag gate. Walk
-  its potential in order and stop at the first child outside the
-  [purity whitelist](cull-cb-checks.md#shared-purity-whitelist); never search past a stateful check
-  for a later gate. Recheck runtime guards when building the lists.
-- A retained decision with unsupported potential, allow or AI modifiers ends speculative culling.
-  Keep it and the entire remaining suffix, because it may affect later checks. Native evaluation,
-  `ai_will_do`, RNG and effects are not replaced.
+- Keep the native manager and B-then-A loop. Check gates when native `AI_DecisionUpdate` reaches each
+  potential, against its actual live scope and world—not a cached country list. Diplomacy and UI
+  calls pass through; native slot checks, `allow`, `ai_will_do`, RNG and commands remain unchanged.
+- A standard-slot-6 decision can fail early on a leading literal tag, AI or flag gate. Search only
+  through deterministic read-only children; stop at the first unsupported child. Later complex
+  conditions do not prevent an earlier safe gate from rejecting the potential.
+- Never trial a random condition during culling. If no gate rules the decision out, run its native
+  potential once. Random/stateful conditions before a gate are not skipped or rerolled.
+- A serial barrier affects only the current decision. The next potential is reconsidered from the
+  resulting live state, so one early unsupported decision does not disable all later work.
+- Logs report reached potentials, gate rejections and sequence-building cost. Per-call dispatch and
+  classification replace the old filtered-list path; a net speedup needs live measurement.

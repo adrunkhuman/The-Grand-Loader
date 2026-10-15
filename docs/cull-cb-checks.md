@@ -24,7 +24,8 @@ on the attacker (`tag = X`, `civilized = yes`, flags) are re-evaluated for every
 - Every actual `CanUse` runs natively with fresh attacker/THIS scopes. Unsupported trigger trees
   are not skipped. After a false evaluation, held membership is rebuilt before checking later types.
 - No attacker predicate is pre-evaluated or cached for the day. Read-only does not imply defender
-  independence or stability across commands and events.
+  independence or stability across commands and events. With `cull_cb_profiling`, logs report optimized
+  versus native scans and the held-list builds/nodes actually visited.
 
 ## Shared purity whitelist
 
@@ -36,7 +37,19 @@ New native findings and guard rationale are documented in
 The inspector admits read-only leaves, recursively checked iterators and deterministic context
 selectors. Flag lookups require native receivers and the CRT C-locale path; getters with lazy shared
 initialization require already initialized objects. Numeric guards are checked on the executing
-thread. Receiver certificates are shared only within a frozen batch, never across native barriers.
+thread. Certify flag receiver domains only when a tree needs them, once per frozen run; no certificate
+survives a native barrier. The table still admits 236 native classes, not five leaf types.
+
+| Permission | Required evidence |
+| --- | --- |
+| Leading-gate rejection | Every skipped earlier child is deterministic and read-only; no trial of a random condition. Later children need not be safe. |
+| Worker evaluation | The concrete evaluated tree is read-only under its runtime guards and the world remains frozen. |
+| Random worker evaluation | Separate ownership, reproducible isolated streams and single-use consumption; not enabled by this branch. |
+| Predicate caching | Complete dependencies and a valid lifetime/invalidation rule; neither read-only nor RNG-only behavior establishes this. |
+
+`barrier_reason` distinguishes incoming-scope RNG, scope writes, shared-state writes, failed runtime
+guards and unclosed paths. These are conservative reasons to stay native, not equivalent effects or
+permissions. A path with unresolved effects is not asserted to mutate shared state.
 
 Unknown or unclosed trees stay native. In particular, missing-variable insertion, vassal-cache
 rebuilds, input-scope writes, `ally`/`local_enemy` selection and nested CB queries are not blanket

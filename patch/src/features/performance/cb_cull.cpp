@@ -75,7 +75,9 @@ struct TypeInfo {
 std::vector<TypeInfo> g_types;
 
 struct Stats {
-    uint64_t scans = 0;          // IsAnyCBUsable calls from the AI
+    uint64_t attempts = 0, native_fallbacks = 0;
+    uint64_t index_builds = 0, held_nodes = 0;
+    uint64_t scans = 0;          // fast-path IsAnyCBUsable calls from the AI
     uint64_t can_use_always = 0; // CanUse calls for `always` types
     uint64_t can_use_held = 0;   // CanUse calls for held, non-`always` types
     uint64_t hits = 0;           // scans that returned true
@@ -123,10 +125,12 @@ uintptr_t g_types_begin = 0;
 bool refresh_types() {
     uintptr_t manager = read32(hooks::exe_addr(kCBManagerPtrRva));
     if (!manager) {
+        g_types_safe = false;
         return false;  // let the original initialize its singleton
     }
     uintptr_t begin = read32(manager + 0x0C), end = read32(manager + 0x10);
     if (end < begin || (end - begin) % 4 || (!begin && end)) {
+        g_types_safe = false;
         return false;
     }
     size_t count = (end - begin) / 4;
@@ -188,9 +192,15 @@ void build_scopes(ScopePair& s, void* attacker_ref, void* defender_ref) {
 // --- held-type membership ------------------------------------------------------------------------
 
 void index_held_types(void* relation, std::vector<uint8_t>& held) {
+    if (g_profiling) {
+        g_stats.index_builds++;
+    }
     std::fill(held.begin(), held.end(), 0);
     for (uintptr_t node = read32(reinterpret_cast<uintptr_t>(relation) + kRelationHeldList); node;
          node = read32(node + kHeldNodeNext)) {
+        if (g_profiling) {
+            g_stats.held_nodes++;
+        }
         uintptr_t cb = read32(node + kHeldNodeCB);
         if (!cb) {
             continue;
@@ -206,7 +216,7 @@ void index_held_types(void* relation, std::vector<uint8_t>& held) {
 
 void report_window(int32_t last_day) {
     int32_t days = last_day - g_window_start_day + 1;
-    if (days <= 0 || g_stats.scans == 0) {
+    if (days <= 0 || g_stats.attempts == 0) {
         return;
     }
     double wall_ms = ms(static_cast<uint64_t>(qpc() - g_window_start_qpc));
@@ -216,6 +226,13 @@ void report_window(int32_t last_day) {
          g_window_start_day, last_day, days, wall_ms / days, ull(g_stats.scans / days), ms(g_stats.scan_ticks) / days,
          ull(g_stats.hits / days), ull(g_stats.can_use_always / days), ull(g_stats.can_use_held / days));
 
+    logf("cb_cull: coverage: %llu/%llu scans optimized, %llu native fallbacks; %llu held-list builds, %llu nodes visited",
+         ull(g_stats.scans), ull(g_stats.attempts), ull(g_stats.native_fallbacks),
+         ull(g_stats.index_builds), ull(g_stats.held_nodes));
+
+    if (!g_types_safe) {
+        return; // a reload/unknown layout must not dereference stale type names for profiling
+    }
     std::vector<size_t> order;
     for (size_t i = 0; i < g_stats.can_use_per_type.size() && i < g_types.size(); i++) {
         if (g_stats.can_use_per_type[i]) {
@@ -256,12 +273,20 @@ char __stdcall is_any_cb_usable_hook(void* relation, void* defender_ref, void* a
     // Include per-scan type validation and membership indexing in the sampled cost.
     bool sampled = g_profiling && (g_stats.scans & (kSample - 1)) == 0;
     int64_t start = sampled ? qpc() : 0;
-    if (!relation || !refresh_types()) {
+    // Refresh before roll_stats: reporting may read type names, including across a reload.
+    bool types_ready = refresh_types();
+    if (g_profiling) {
+        roll_stats(day);
+        g_stats.attempts++;
+    }
+    if (!relation || !types_ready) {
+        if (g_profiling) {
+            g_stats.native_fallbacks++;
+        }
         return g_is_any_cb_usable(relation, defender_ref, attacker_ref);
     }
 
     if (g_profiling) {
-        roll_stats(day);
         g_stats.scans++;
         if (g_stats.can_use_per_type.size() < g_types.size()) {
             g_stats.can_use_per_type.resize(g_types.size());

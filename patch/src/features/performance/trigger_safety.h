@@ -10,7 +10,10 @@
 
 namespace cp::features::trigger_safety {
 
-// Purity only, NOT attacker independence, cache lifetime, or script scope-type validity.
+// Deterministic read-only execution only, NOT attacker independence, cache lifetime,
+// or script scope-type validity. RNG-only rejection is not a claim of shared-state mutation.
+// Random paths remain native until ownership, stream isolation and single-use consumption
+// are independently established; no cache or worker permission follows from an effect label.
 // Evidence: docs/cull-cb-checks.md#shared-purity-whitelist and the 2026-10-15
 // trigger-whitelist audit of original Victoria II 3.04 (native VAs use image base 00400000).
 // Requires valid original native objects/indices/code, fully constructed published
@@ -18,12 +21,16 @@ namespace cp::features::trigger_safety {
 // Never call an initializer to satisfy a guard.
 // Native receiver type domains are the audited RTTI domains; arbitrary replacement objects
 // or helper hooks invalidate that contract even when a trigger's Evaluate slot is unchanged.
+enum class BarrierReason : uint8_t {
+    None, ScopeRng, ScopeWrite, SharedWrite, RuntimeGuard, Unclosed, Count
+};
+
 struct Inspector {
     uintptr_t base;
     uint32_t (*read32)(uintptr_t);
     uint8_t (*read8)(uintptr_t);
-    uintptr_t and_alias = 0; // our private CAndTrigger vtable (profiling/event dispatch only)
-    // Raw aggregate inspectors remain uncached. Only snapshot() issues receiver certificates.
+    uintptr_t and_alias = 0; // our private CAndTrigger vtable (feature dispatch only)
+    // Raw aggregate inspectors remain uncached. snapshot()/certify_for() issue receiver certificates.
     int8_t cached_country_flags = -1;
     int8_t cached_global_flags = -1;
 
@@ -39,6 +46,22 @@ struct Inspector {
         result.cached_global_flags = -1;
         result.cached_country_flags = result.country_flags() ? 1 : 0;
         result.cached_global_flags = result.global_flags() ? 1 : 0;
+        return result;
+    }
+
+    // Main-thread builder for a frozen interval: certify only receiver domains this tree
+    // can reach, retaining previous certificates for the same interval. Publish the returned
+    // value to workers only AFTER the run is fully classified. Never mutate it during work.
+    Inspector certify_for(uintptr_t trigger) const {
+        Inspector result = *this;
+        unsigned remaining = max_nodes;
+        uint8_t domains = flag_domains(trigger, 0, remaining);
+        if ((domains & 1) && cached_country_flags < 0) {
+            result.cached_country_flags = country_flags() ? 1 : 0;
+        }
+        if ((domains & 2) && cached_global_flags < 0) {
+            result.cached_global_flags = global_flags() ? 1 : 0;
+        }
         return result;
     }
 
@@ -90,32 +113,22 @@ struct Inspector {
         return tree(trigger, depth, remaining);
     }
 
-    // AI_DecisionUpdate walks both trigger blocks and EVERY ai_will_do modifier's
-    // +08/+0c children directly (00874ea0); modifier headers need not be normal ANDs.
-    bool decision_parallel_safe(uintptr_t decision) const {
-        if (!object(decision, 0x124)) {
+    // Only potential is precomputed. Native allow/ai_will_do are serial barriers after a
+    // true potential, so they do not need to pass the worker certificate.
+    bool decision_potential_safe(uintptr_t decision) const {
+        if (!object(decision, 0x40)) {
             return false;
         }
         uintptr_t vtable = read32(decision);
+        return object(vtable, 0x1C) && read32(vtable + 0x18) == base + 0x631490 &&
+               pure_tree(decision + 0x24);
+    }
+
+    // First reason a path stays native, not a complete effect summary or a cache certificate.
+    // A label denotes a MAY-write path; input-dependent read-only subsets need separate proofs.
+    BarrierReason barrier_reason(uintptr_t trigger) const {
         unsigned remaining = max_nodes;
-        if (!object(vtable, 0x1C) || read32(vtable + 0x18) != base + 0x631490 ||
-            !tree(decision + 0x24, 0, remaining) || !tree(decision + 0x40, 0, remaining)) {
-            return false;
-        }
-        uintptr_t begin = read32(decision + 0x11C), end = read32(decision + 0x120);
-        if (!valid_range(begin, end)) {
-            return false;
-        }
-        for (uintptr_t it = begin; it < end; it += 4) {
-            if (remaining == 0) {
-                return false;
-            }
-            --remaining;
-            if (!children(read32(it), 0, remaining)) {
-                return false;
-            }
-        }
-        return true;
+        return reason(trigger, 0, remaining);
     }
 
 private:
@@ -153,7 +166,15 @@ private:
         if (!object(vtable, 0x1C) || vtable < base) {
             return false;
         }
-        // Sorted by vtable RVA. Both identity and raw Evaluate slot must match the audit.
+        const auto* entry = lookup(vtable);
+        return entry && guarded(entry->guard, trigger) &&
+               (!entry->recursive || children(trigger, depth, remaining));
+    }
+
+    const detail::Entry* lookup(uintptr_t vtable) const {
+        if (!object(vtable, 0x1C) || vtable < base) {
+            return nullptr;
+        }
         unsigned first = 0, last = sizeof(detail::entries) / sizeof(detail::entries[0]);
         while (first < last) {
             unsigned mid = first + (last - first) / 2;
@@ -163,12 +184,89 @@ private:
             } else if (vtable - base > entry.vtable) {
                 first = mid + 1;
             } else {
-                return read32(vtable + 0x18) == base + entry.evaluate &&
-                       guarded(entry.guard, trigger) &&
-                       (!entry.recursive || children(trigger, depth, remaining));
+                return read32(vtable + 0x18) == base + entry.evaluate ? &entry : nullptr;
             }
         }
-        return false;
+        return nullptr;
+    }
+
+    BarrierReason reason(uintptr_t trigger, unsigned depth, unsigned& remaining) const {
+        using R = BarrierReason;
+        if (!object(trigger, 0x34) || depth >= 64 || remaining == 0) {
+            return R::Unclosed;
+        }
+        --remaining;
+        uintptr_t vt = read32(trigger);
+        const auto* entry = lookup(vt);
+        bool recursive = and_alias && vt == and_alias;
+        if (entry) {
+            recursive = entry->recursive;
+            if (!guarded(entry->guard, trigger)) {
+                if (entry->guard == detail::Guard::Context && scope_constructor_safe()) {
+                    uintptr_t selector = read32(trigger + 0x1C);
+                    if (object(selector, 0x110) && read32(selector + 0x10C) == 0 &&
+                        (read32(selector) == 0x3E8 || read32(selector) == 0x717)) {
+                        return R::ScopeRng;
+                    }
+                }
+                return R::RuntimeGuard;
+            }
+        } else if (!recursive) {
+            if (!object(vt, 0x1C)) {
+                return R::Unclosed;
+            }
+            uint32_t eval = read32(vt + 0x18);
+            if ((vt == base + 0xA30F90 && eval == base + 0x4D7D40) ||
+                (vt == base + 0xA30FC8 && eval == base + 0x4D8030) ||
+                (vt == base + 0xA31150 && eval == base + 0x4DA5C0) ||
+                (vt == base + 0xA32880 && eval == base + 0x4FF670)) {
+                return R::SharedWrite;
+            }
+            if (vt == base + 0xA32D18 && eval == base + 0x502790) {
+                return R::ScopeWrite;
+            }
+            return R::Unclosed;
+        }
+        if (recursive) {
+            uintptr_t begin = read32(trigger + 8), end = read32(trigger + 12);
+            if (!valid_range(begin, end)) {
+                return R::Unclosed;
+            }
+            for (uintptr_t it = begin; it < end; it += 4) {
+                auto result = reason(read32(it), depth + 1, remaining);
+                if (result != R::None) {
+                    return result;
+                }
+            }
+        }
+        return R::None;
+    }
+
+    uint8_t flag_domains(uintptr_t trigger, unsigned depth, unsigned& remaining) const {
+        if (!object(trigger, 0x34) || depth >= 64 || remaining == 0) {
+            return 0;
+        }
+        --remaining;
+        uintptr_t vt = read32(trigger);
+        if (vt == base + 0xA307E8) {
+            return 1;
+        }
+        if (vt == base + 0xA30820) {
+            return 2;
+        }
+        const auto* entry = lookup(vt);
+        if (!(and_alias && vt == and_alias) && (!entry || !entry->recursive)) {
+            return 0;
+        }
+        uintptr_t begin = read32(trigger + 8), end = read32(trigger + 12);
+        if (!valid_range(begin, end)) {
+            return 0;
+        }
+        uint8_t domains = 0;
+        for (uintptr_t it = begin; it < end && domains != 3 && remaining; it += 4) {
+            domains |= flag_domains(read32(it), depth + 1, remaining);
+        }
+        return domains;
     }
 
     bool country_range(uintptr_t& begin, uintptr_t& end) const {

@@ -19,11 +19,17 @@ at once and changes the game.
   [purity whitelist](cull-cb-checks.md#shared-purity-whitelist) enter worker batches; unsupported
   checks run once natively and form serial barriers, rather than disabling the whole scan.
 - When the scan asks for a trigger, the next chunk of 1024 entries is evaluated on the worker pool with
-  copies of the scan's own scope (pointers inside the scope, such as THIS at `+0x24`, are moved into each
-  copy), and each call is answered from it as long as it is exactly the next entry; anything else runs the
+  copies of the scan's own scope. Rebind only a genuine THIS self-reference at `+0x24`; retain
+  external aliases and scalar seeds/IDs unchanged. Each call is answered from its single-use result
+  as long as it matches the listed sequence; an unlisted call runs the
   original code and disables the fast path for the rest of the scan.
 - Results are discarded after a serial barrier or a true trigger, before its MTTH modifiers run—even
   if no event fires. The next batch uses the resulting live scope and world. Firing also invalidates
   results. MTTH, random draws and firing stay on the game thread in their native order.
 - `2` = shadow mode: the game keeps its own evaluation; pure runs are compared and logged. Unsupported
-  checks are not evaluated an extra time for diagnostics.
+  checks are not evaluated an extra time for diagnostics. RNG-only paths are distinguished from scope
+  writes and shared-state writes, but stay native until stream isolation and single-use random
+  results have their own proof.
+- Coverage logs report reached/served triggers, speculative work, guard failures and serial-barrier
+  reasons. These counters support future live measurements; static script coverage is not runtime
+  fast-path coverage or a speedup measurement.
