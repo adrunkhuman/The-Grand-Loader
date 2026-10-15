@@ -11,23 +11,20 @@ Once per AI country per day, `AI_DecisionUpdate` (`0x00821190`) evaluates the `p
 false before they start:
 
 - a decision with a top-level `tag = X`, evaluated for a country other than X (~213 k a day);
-- a decision with a top-level `ai = no`, evaluated for an AI country;
-- a (country, decision) pair whose top-level `NOT = { has_*_flag }` gate already failed, with a flag that
-  nothing clears.
+- a decision with a top-level `ai = no`, evaluated for an AI country.
 
 A hook on each evaluation cannot win: the evaluations cost tens of nanoseconds, about as much as the hook.
 The work has to disappear from the loop.
 
 ## How
 
-- Each AI country gets its own decision lists without those decisions. `AI_DecisionUpdate` (called at
-  `0x0081EA9B`) reads the global manager `DAT_01319730`; a wrapper points it at a private copy holding the
-  country's lists for the duration of the call. `AI_DiplomacyUpdate`'s two getter calls (`0x0085D34F`,
-  `0x0085D459`) get the same lists. The loops run unchanged on fewer entries, in the same order.
-- A list is built by evaluating, for that country, only the direct children of `potential` that were
-  classified once: a `tag` trigger with a literal tag, an `ai` trigger, and a `NOT` block made only of
-  `has_country_flag` / `has_global_flag`.
-- Lists are rebuilt when `clr_country_flag` (that country) or `clr_global_flag` runs (hooks on their
-  `Execute` vtable slots), when a save is loaded, every 90 game days, and when the decision list changes.
-- `potential` is a short-circuit AND with no side effects, so a decision left out is one the game would
-  have evaluated to false. The player's alert, the UI, `allow`, `ai_will_do` and effects are untouched.
+- Immediately before `AI_DecisionUpdate` (`0x0081EA9B`), build private lists in native B-then-A order
+  and point the global manager `DAT_01319730` at that copy for the call. No filtered list survives
+  another AI update, command or flag/controller change. Diplomacy, player alerts and UI stay native.
+- A standard-slot-6 decision may be removed by a failing leading literal tag, AI or flag gate. Walk
+  its potential in order and stop at the first child outside the
+  [purity whitelist](cull-cb-checks.md#shared-purity-whitelist); never search past a stateful check
+  for a later gate. Recheck runtime guards when building the lists.
+- A retained decision with unsupported potential, allow or AI modifiers ends speculative culling.
+  Keep it and the entire remaining suffix, because it may affect later checks. Native evaluation,
+  `ai_will_do`, RNG and effects are not replaced.
