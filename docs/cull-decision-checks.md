@@ -18,14 +18,13 @@ The work has to disappear from the loop.
 
 ## How
 
-- Each AI country gets its own decision lists without those decisions. `AI_DecisionUpdate` (called at
-  `0x0081EA9B`) reads the global manager `DAT_01319730`; a wrapper points it at a private copy holding the
-  country's lists for the duration of the call. `AI_DiplomacyUpdate`'s two getter calls (`0x0085D34F`,
-  `0x0085D459`) get the same lists. The loops run unchanged on fewer entries, in the same order.
-- Only decisions with the standard slot 6 and an entirely
-  [pure potential](cull-cb-checks.md#shared-purity-whitelist) may be removed by a failing literal tag
-  or AI gate. Unsupported potentials, including flag predicates, stay in their original positions.
-- Lists are rebuilt when `clr_country_flag` (that country) or `clr_global_flag` runs (hooks on their
-  `Execute` vtable slots), when a save is loaded, every 90 game days, and when the decision list changes.
-- A false check can still advance scope RNG and affect later decisions; only pure potentials are
-  culled. The player's alert, the UI, `allow`, `ai_will_do` and effects are untouched.
+- Immediately before `AI_DecisionUpdate` (`0x0081EA9B`), build private lists in native B-then-A order
+  and point the global manager `DAT_01319730` at that copy for the call. No filtered list survives
+  another AI update, command or flag/controller change. Diplomacy, player alerts and UI stay native.
+- A standard-slot-6 decision may be removed by a failing leading literal tag, AI or flag gate. Walk
+  its potential in order and stop at the first child outside the
+  [purity whitelist](cull-cb-checks.md#shared-purity-whitelist); never search past a stateful check
+  for a later gate. Recheck runtime guards when building the lists.
+- A retained decision with unsupported potential, allow or AI modifiers ends speculative culling.
+  Keep it and the entire remaining suffix, because it may affect later checks. Native evaluation,
+  `ai_will_do`, RNG and effects are not replaced.

@@ -32,9 +32,10 @@
 // the game, so the results computed before it are dropped and the next chunk is computed afresh. Calls
 // that do not match (nested evaluations, a candidate list changed by an effect) run the original code.
 // MTTH, the draw and Event_Fire stay on the game thread in the original order. Shadow mode (2) answers
-// every call with the original code and compares. Both modes require the WHOLE listed scan to
-// contain only whitelisted pure trees. The native scan reuses one scope; a boolean-only result
-// cannot replace a trigger that advances its seed, even if that trigger ultimately returns false.
+// every eligible call with the original code and compares. Only contiguous pure runs enter a
+// batch. Unsupported checks run once, natively, and form serial barriers. A true trigger also
+// ends the batch: its following MTTH modifiers are not certified and can change the shared scope
+// even when no event fires. The next run starts from the resulting live scope/world.
 
 namespace cp::features {
 
@@ -86,6 +87,7 @@ bool g_in_scan = false;
 bool g_country_pass = false;
 volatile uint8_t g_fired = 0;     // an event fired since the current results were computed
 volatile int32_t g_fire_depth = 0;
+int g_native_depth = 0; // nested checks during serial barriers/shadow evaluation pass through
 alignas(16) unsigned char g_template[kScopeSize];
 
 // statistics since the last report
@@ -139,32 +141,55 @@ void fill_scope(unsigned char* scope, const Entry& e) {
 
 // Worker task: entries [base + index * kPerTask, ...) of the current chunk.
 size_t g_chunk_begin = 0, g_chunk_end = 0;
-void evaluate_task(int index, void*) {
+void evaluate_task(int index, void* context) {
     size_t begin = g_chunk_begin + static_cast<size_t>(index) * kPerTask;
     size_t end = begin + kPerTask < g_chunk_end ? begin + kPerTask : g_chunk_end;
     alignas(16) unsigned char scope[kScopeBuffer];
     for (size_t i = begin; i < end; i++) {
         Entry& e = g_seq[i];
+        const auto& safety = *static_cast<const trigger_safety::Inspector*>(context);
+        // Numeric guards belong to the actual worker thread, not just the classifier.
+        if (!safety.pure_tree(e.self)) {
+            continue; // result stays unavailable; the main thread will run it natively
+        }
         fill_scope(scope, e);
         e.result = evaluate_original(e.self, scope) ? 1 : 0;
     }
 }
 
-void compute_chunk(void* live_scope) {
+bool compute_chunk(void* live_scope) {
     int64_t start = qpc();
+    auto safety = trigger_safety::Inspector{hooks::exe_base(), read32, read8,
+        reinterpret_cast<uintptr_t>(g_fake_vtable)}.snapshot();
+    g_chunk_begin = g_chunk_end = g_next;
+    size_t limit = g_next + kChunk < g_seq.size() ? g_next + kChunk : g_seq.size();
+    while (g_chunk_end < limit && safety.pure_tree(g_seq[g_chunk_end].self)) {
+        g_seq[g_chunk_end++].result = 2; // no result until a certified worker finishes it
+    }
+    if (g_chunk_end == g_next) {
+        return false;
+    }
     std::memcpy(g_template, live_scope, kScopeSize);
     g_template_origin = reinterpret_cast<uintptr_t>(live_scope);
-    g_chunk_begin = g_next;
-    g_chunk_end = g_next + kChunk < g_seq.size() ? g_next + kChunk : g_seq.size();
     int tasks = static_cast<int>((g_chunk_end - g_chunk_begin + kPerTask - 1) / kPerTask);
-    parallel::run(tasks, &evaluate_task, nullptr);
+    parallel::run(tasks, &evaluate_task, &safety);
     g_ready_end = g_chunk_end;
     g_chunks++;
     g_batch_ticks += static_cast<uint64_t>(qpc() - start);
+    return true;
+}
+
+char evaluate_serial(uintptr_t self, void* scope) {
+    g_passthrough++;
+    g_ready_end = g_next; // the next run must observe all native scope/world writes
+    g_native_depth++;
+    char result = evaluate_original(self, scope);
+    g_native_depth--;
+    return result;
 }
 
 char __fastcall evaluate_hook(void* self, void*, void* scope) {
-    if (!g_in_scan || g_fire_depth > 0) {
+    if (!g_in_scan || g_fire_depth > 0 || g_native_depth > 0) {
         return g_original_evaluate(self, nullptr, scope);
     }
     uintptr_t s = reinterpret_cast<uintptr_t>(self);
@@ -187,13 +212,18 @@ char __fastcall evaluate_hook(void* self, void*, void* scope) {
         g_fired = 0;
         g_ready_end = g_next;  // computed before the event ran its effects
     }
-    if (g_next >= g_ready_end) {
-        compute_chunk(scope);
+    if (g_next >= g_ready_end && !compute_chunk(scope)) {
+        g_next++;
+        return evaluate_serial(s, scope);
     }
-    char result = static_cast<char>(g_seq[g_next].result);
-    g_next++;
+    char result = static_cast<char>(g_seq[g_next++].result);
+    if (result == 2) {
+        return evaluate_serial(s, scope);
+    }
     if (g_mode == 2) {
+        g_native_depth++;
         char serial = g_original_evaluate(self, nullptr, scope) ? 1 : 0;
+        g_native_depth--;
         g_compared++;
         if (serial != result) {
             g_mismatches++;
@@ -203,7 +233,13 @@ char __fastcall evaluate_hook(void* self, void*, void* scope) {
                      serial, result);
             }
         }
+        if (serial || serial != result) {
+            g_ready_end = g_next;
+        }
         return serial;
+    }
+    if (result) {
+        g_ready_end = g_next; // native MTTH evaluation follows before the next trigger
     }
     g_served++;
     return result;
@@ -212,10 +248,7 @@ char __fastcall evaluate_hook(void* self, void*, void* scope) {
 bool add_entry(uintptr_t event, uint32_t key, uint32_t tag) {
     uintptr_t block = event + kEventTrigger;
     uintptr_t vtable = read32(block);
-    const trigger_safety::Inspector safety{hooks::exe_base(), read32, read8,
-                                           reinterpret_cast<uintptr_t>(g_fake_vtable)};
-    if ((vtable != g_and_vtable && vtable != reinterpret_cast<uintptr_t>(g_fake_vtable)) ||
-        !safety.pure_tree(block)) {
+    if (vtable != g_and_vtable && vtable != reinterpret_cast<uintptr_t>(g_fake_vtable)) {
         return false;
     }
     g_seq.push_back(Entry{block, key, tag, 0});
@@ -252,7 +285,7 @@ void __cdecl scan_begin() {
             uintptr_t begin = read32(owner + kCountryEvents), end = read32(owner + kCountryEvents + 4);
             for (uintptr_t it = begin; it < end; it += 4) {
                 if (!add_entry(read32(it), index, read32(c + kCountryTag))) {
-                    return;  // whole scan native; no vtable changes or speculative evaluations yet
+                    return;  // unknown root layout: leave the scan native before publishing hooks
                 }
             }
         }
@@ -277,8 +310,8 @@ void __cdecl scan_begin() {
             }
         }
     }
-    // Publish only after every candidate was checked. Vtables left from an earlier eligible scan
-    // pass straight through while g_in_scan is false; fallback never adds a native evaluation.
+    // Publish only after all root layouts were checked. Child purity is checked per run,
+    // after the preceding serial barrier; unsupported children do not disable the whole scan.
     for (const Entry& e : g_seq) {
         *reinterpret_cast<uintptr_t*>(e.self) = reinterpret_cast<uintptr_t>(g_fake_vtable);
     }
@@ -361,7 +394,8 @@ void install_events_parallel(const Config& config) {
     g_fire = hooks::exe_addr(kFireRva);
     std::memcpy(g_fake_vtable, reinterpret_cast<const void*>(g_and_vtable), sizeof(g_fake_vtable));
     g_original_evaluate = reinterpret_cast<EvaluateFn>(g_fake_vtable[kVtableEvaluate / 4]);
-    if (!hooks::expect_bytes(reinterpret_cast<uintptr_t>(g_original_evaluate), "\x55\x8B\xEC", 3) ||
+    if (reinterpret_cast<uintptr_t>(g_original_evaluate) != hooks::exe_addr(0x4B8260) ||
+        !hooks::expect_bytes(reinterpret_cast<uintptr_t>(g_original_evaluate), "\x55\x8B\xEC", 3) ||
         !hooks::expect_bytes(hooks::exe_addr(kScanCallRva), "\xE8", 1)) {
         logf("parallel_events: CAndTrigger::Evaluate or the scan call not recognised, feature off");
         return;
@@ -386,7 +420,7 @@ void install_events_parallel(const Config& config) {
         logf("parallel_events: scan call site already hooked (tick_profiler?), feature off");
         return;
     }
-    logf("parallel_events: active (%s): worker batches only when the entire scan has pure trigger trees",
+    logf("parallel_events: active (%s): pure runs, serial barriers and fresh batches after MTTH",
          g_mode == 2 ? "shadow mode, the game still uses its own evaluation" : "results used");
 }
 

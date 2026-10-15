@@ -15,14 +15,16 @@ check may otherwise advance the shared scope RNG and change later decisions.
 ## How
 
 - Requires `cull_decision_checks = 1` and `fast_ai_queue = 1`.
-- Every retained decision's slot 6 must be the standard implementation; `potential`, `allow` and all
-  `ai_will_do` modifier trees must pass the [purity whitelist](cull-cb-checks.md#shared-purity-whitelist).
-  Otherwise both country lists stay serial, including in shadow mode; complex mod trees often fall back.
-- A worker pool (logical processors − 1, at most 7) runs batches with the game thread's FPU state.
-- At the start of the frame in which `fast_ai_queue` drains the AI queue, the countries waiting in it are
-  read from the queue, and the workers evaluate `potential` and `allow` of every decision of each
-  country's list, with the same scope the game builds, in native B-then-A list order.
-- When the game then runs `AI_DecisionUpdate` for a country, it gets only the decisions that passed, in the
-  original order; `ai_will_do`, the `rand()` roll and the command run in the game's own code, so the same
-  rolls happen. A result is used only for the same frame, AI object and list version.
-- `2` = shadow mode: the game keeps its own evaluation; only eligible countries are compared and logged.
+- Only the leading run of decisions with standard slot 6 and pure `potential`, `allow` and all
+  `ai_will_do` modifier children enters a batch. The
+  [purity whitelist](cull-cb-checks.md#shared-purity-whitelist) is checked under current runtime guards.
+  The first retained unsupported decision and the complete suffix remain native, including all A
+  entries if the barrier is in B.
+- A worker pool (logical processors − 1, at most 7) uses the game thread's FPU state and native scope
+  setup. Compute one country's prefix immediately before its AI update—not future countries at frame
+  start, where intervening native work could make results stale.
+- Remove failed pure-prefix checks and retain survivors in original B-then-A order. The game rechecks
+  survivors and executes `ai_will_do`, `rand()` and commands itself. No speculative result survives
+  the native update.
+- `2` = shadow mode: keep original lists and compare only the pure prefix. Unsupported suffix checks
+  are never run an extra time. Early unsafe entries can still limit optimization coverage.

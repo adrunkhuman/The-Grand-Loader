@@ -2,7 +2,7 @@
 
 ## Source
 
-`patch/src/features/performance/cb_cull.cpp`, safety checks in `patch/src/features/performance/trigger_safety.h`.
+`patch/src/features/performance/cb_cull.cpp`.
 Research: [re/systems/casus-belli.md](re/systems/casus-belli.md).
 
 ## Why
@@ -17,17 +17,27 @@ on the attacker (`tag = X`, `civilized = yes`, flags) are re-evaluated for every
 
 - The two AI call sites (`0x0085DCDA`, `0x0085E5FB`) go to a replacement of the loop; the UI, the console,
   the `casus_belli` trigger and war planning keep calling the original.
-- Every real type must have the expected layout, standard `CanUse` and a pure `can_use` tree
-  (see below). Otherwise the whole scan stays native, without a trigger pre-pass.
-- Once per attacker and day, the attacker-only direct children of each eligible type's `can_use` are
-  evaluated; a type with a false one is dead for that attacker for the day.
-- Per target, `CanUse` runs for the live `always` and held types, stopping at the first true. Each call
-  gets fresh scopes (attacker; `+0x24` -> THIS = defender), matching native per-type construction.
-- Skipping and reordering are restricted to pure trees: an `ally` scope check can advance scope RNG
-  even when false (`scope+0x40`, helper `0x009B7910`).
+- Standard type layouts and native `IsRealType`/`CanUse` dispatch are checked before evaluation;
+  unknown implementations leave the whole scan native.
+- Held CB types are indexed once instead of searching the same linked list for every type. Types
+  remain in manager order, including `always` types, and the scan stops at the first true result.
+- Every actual `CanUse` runs natively with fresh attacker/THIS scopes. Unsupported trigger trees
+  are not skipped. After a false evaluation, held membership is rebuilt before checking later types.
+- No attacker predicate is pre-evaluated or cached for the day. Read-only does not imply defender
+  independence or stability across commands and events.
 
 ## Shared purity whitelist
 
-Only `AND`/`OR`/`NOT` trees containing `always`, `year`, `month`, `ai` and literal `tag` qualify.
-Native Evaluate slots are checked; unknown classes, context/flag predicates and THIS/FROM tags fall
-back to native evaluation. Coverage is deliberately small, especially for modded trigger trees.
+Event and decision speculation use `trigger_safety.h` and its audited native vtable/Evaluate table
+in `trigger_safety_data.h`. The CB membership optimization does not speculate and does not need it.
+New native findings and guard rationale are documented in
+[Smedley's trigger-purity research](https://github.com/adrunkhuman/smedley_kernel/blob/d6c8e0eb7c1bb615ce943821204c92e542b50883/mappings/research/native-trigger-purity.md).
+
+The inspector admits read-only leaves, recursively checked iterators and deterministic context
+selectors. Flag lookups require native receivers and the CRT C-locale path; getters with lazy shared
+initialization require already initialized objects. Numeric guards are checked on the executing
+thread. Receiver certificates are shared only within a frozen batch, never across native barriers.
+
+Unknown or unclosed trees stay native. In particular, missing-variable insertion, vassal-cache
+rebuilds, input-scope writes, `ally`/`local_enemy` selection and nested CB queries are not blanket
+approvals. Purity is neither permission to cache across defenders nor a whole-day validity guarantee.
