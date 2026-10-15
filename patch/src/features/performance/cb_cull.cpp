@@ -6,10 +6,9 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
-#include "features/performance/cb_cull_triggers.h"
+#include "features/performance/trigger_safety.h"
 #include "game/world.h"
 #include "hooks/memory.h"
 #include "log.h"
@@ -26,12 +25,10 @@
 //           else build two CEventScopes (self; THIS = D) and return T->CanUse(scope)  vtable slot 8
 //       return true at the first usable type
 //
-// So per (attacker, defender) pair the original walks the held list once per type (~100 times) and
-// builds two scopes per `always` type. The result is a boolean OR, so order does not matter. This
-// replacement, installed at the two AI call sites, computes per (attacker, day) which `always` types
-// survive their attacker-only conditions (a direct child of `can_use` that never looks at THIS/FROM is
-// the same for every defender), then per pair builds the two scopes once and calls CanUse only for
-// those types and for the types actually held against that defender (one walk of the held list).
+// The replacement is eligible only when every real type has a whitelisted pure can_use tree.
+// Otherwise the entire scan stays native, without a trigger pre-pass. For eligible trees, cache
+// attacker-only failures and walk the held list once. Each CanUse gets a FRESH pair of scopes,
+// matching the two constructor calls at 0x0092EF71 / 0x0092EF7E, not one pair shared by all types.
 
 namespace cp::features {
 
@@ -43,9 +40,6 @@ constexpr uint32_t kScopeCtorRva = 0x4A8650;        // CEventScope::ctor(this, p
 constexpr uint32_t kScanCallSites[] = {0x45DCDA,    // in AI_ScoreWarTargets
                                        0x45E5FB};   // in AI_ScoreDiplomaticTargets
 constexpr uint32_t kCBManagerPtrRva = 0xF1ACAC;     // DAT_0131ACAC, +0xC/+0x10 = vector<CCasusBelliType*>
-constexpr uint32_t kAndVtableRva = 0x9F9994;        // CAndTrigger::vftable
-constexpr uint32_t kOrVtableRva = 0xA2FB70;         // COrTrigger::vftable
-constexpr uint32_t kNotVtableRva = 0xA2FBA8;        // CNotTrigger::vftable
 
 constexpr uint32_t kCBTypeCanUse = 0x4C;     // CCasusBelliType::can_use (embedded CAndTrigger)
 constexpr uint32_t kCBTypeName = 0x14;       // std::string (SSO): buffer/pointer +0x14, size +0x24, capacity +0x28
@@ -58,8 +52,6 @@ constexpr uint32_t kHeldNodeNext = 0x08;
 constexpr uint32_t kCBTypeIndex = 0x24;      // CCasusBelli: index of its type in the manager list
 constexpr uint32_t kBlockBegin = 0x08;       // trigger block: vector<CTrigger*> begin
 constexpr uint32_t kBlockEnd = 0x0C;         //                                 end
-constexpr uint32_t kTriggerThisFlag = 0x18;  // value was `THIS`
-constexpr uint32_t kTriggerFromFlag = 0x19;  // value was `FROM`
 constexpr uint32_t kVtableEvaluate = 0x18;   // CTrigger slot 6: bool Evaluate(scope)
 constexpr uint32_t kScopeTag = 0x08;         // CEventScope: country tag
 constexpr uint32_t kScopeThis = 0x24;        //              THIS scope pointer
@@ -79,10 +71,7 @@ IsAnyCBUsableFn g_is_any_cb_usable = nullptr;
 ScopeCtorFn g_scope_ctor = nullptr;
 bool g_profiling = false;
 
-uintptr_t g_and_vtable = 0;
-uintptr_t g_or_vtable = 0;
-uintptr_t g_not_vtable = 0;
-std::unordered_set<uintptr_t> g_attacker_only_classes;
+bool g_types_safe = false;
 
 // Per CB type, static once the files are loaded.
 struct TypeInfo {
@@ -156,28 +145,6 @@ std::string cb_type_name(uintptr_t type) {
 
 // --- trigger classification ----------------------------------------------------------------------
 
-bool is_attacker_only(uintptr_t trigger);
-
-bool children_attacker_only(uintptr_t block) {
-    for (uintptr_t it = read32(block + kBlockBegin), end = read32(block + kBlockEnd); it < end; it += 4) {
-        if (!is_attacker_only(read32(it))) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool is_attacker_only(uintptr_t trigger) {
-    uintptr_t vtable = read32(trigger);
-    if (vtable == g_and_vtable || vtable == g_or_vtable || vtable == g_not_vtable) {
-        return children_attacker_only(trigger);
-    }
-    if (!g_attacker_only_classes.contains(vtable)) {
-        return false;
-    }
-    return read8(trigger + kTriggerThisFlag) == 0 && read8(trigger + kTriggerFromFlag) == 0;
-}
-
 inline bool evaluate(uintptr_t trigger, void* scope) {
     auto fn = reinterpret_cast<EvaluateFn>(read32(read32(trigger) + kVtableEvaluate));
     return fn(reinterpret_cast<void*>(trigger), nullptr, scope) != 0;
@@ -205,16 +172,29 @@ void refresh_types() {
     g_types_begin = begin;
     g_types.assign(count, TypeInfo{});
     size_t classified = 0, always = 0;
+    const trigger_safety::Inspector safety{hooks::exe_base(), read32, read8};
+    g_types_safe = true;
     for (size_t i = 0; i < count; i++) {
         TypeInfo& info = g_types[i];
         info.type = read32(begin + i * 4);
+        uintptr_t vtable = read32(info.type);
+        // Only the standard type and null type have audited IsRealType/CanUse implementations.
+        if (vtable != hooks::exe_addr(0xA33724) && vtable != hooks::exe_addr(0xA3374C)) {
+            g_types_safe = false;
+            continue;
+        }
         info.real = is_real_type(info.type);
         info.always = read8(info.type + kCBTypeAlways) != 0;
         uintptr_t block = info.type + kCBTypeCanUse;
-        for (uintptr_t it = read32(block + kBlockBegin), end = read32(block + kBlockEnd); it < end; it += 4) {
-            uintptr_t child = read32(it);
-            if (is_attacker_only(child)) {
-                info.attacker_only.push_back(child);
+        if (info.real && (read32(info.type + 0x08) != i ||
+                          read32(vtable + kVtableCanUse) != hooks::exe_addr(0x50A7F0) || !safety.pure_tree(block))) {
+            g_types_safe = false;
+            continue;
+        }
+        if (info.real) {
+            // All currently whitelisted leaves are attacker-only (tag requires a literal).
+            for (uintptr_t it = read32(block + kBlockBegin), end = read32(block + kBlockEnd); it < end; it += 4) {
+                info.attacker_only.push_back(read32(it));
             }
         }
         classified += info.attacker_only.empty() ? 0 : 1;
@@ -223,7 +203,8 @@ void refresh_types() {
     for (AttackerState& a : g_attackers) {
         a.day = -1;
     }
-    logf("cb_cull: %zu CB types, %zu `always`, %zu with attacker-only conditions in can_use", count, always, classified);
+    logf("cb_cull: %zu CB types, %zu `always`, %zu with pure attacker-only conditions; %s", count, always, classified,
+         g_types_safe ? "fast path eligible" : "unsupported tree/layout: native scans only");
 }
 
 // --- scopes --------------------------------------------------------------------------------------
@@ -345,6 +326,9 @@ char __stdcall is_any_cb_usable_hook(void* relation, void* defender_ref, void* a
         return g_is_any_cb_usable(relation, defender_ref, attacker_ref);
     }
     refresh_types();
+    if (!g_types_safe) {
+        return g_is_any_cb_usable(relation, defender_ref, attacker_ref);
+    }
     AttackerState* state = state_for(attacker_ref, day);
     if (!state) {
         return g_is_any_cb_usable(relation, defender_ref, attacker_ref);
@@ -371,7 +355,6 @@ char __stdcall is_any_cb_usable_hook(void* relation, void* defender_ref, void* a
         return 0;  // nothing to test: the scopes are not needed
     }
     ScopePair scopes;
-    build_scopes(scopes, attacker_ref, defender_ref);
 
     // `always = yes` types that survived the attacker-only conditions today
     for (uint32_t i : state->live_always) {
@@ -379,6 +362,7 @@ char __stdcall is_any_cb_usable_hook(void* relation, void* defender_ref, void* a
             g_stats.can_use_always++;
             g_stats.can_use_per_type[i]++;
         }
+        build_scopes(scopes, attacker_ref, defender_ref);
         if (can_use(g_types[i].type, scopes.main)) {
             result = 1;
             break;
@@ -401,6 +385,7 @@ char __stdcall is_any_cb_usable_hook(void* relation, void* defender_ref, void* a
                 g_stats.can_use_held++;
                 g_stats.can_use_per_type[i]++;
             }
+            build_scopes(scopes, attacker_ref, defender_ref);
             if (can_use(g_types[i].type, scopes.main)) {
                 result = 1;
                 break;
@@ -429,15 +414,6 @@ void install_cb_cull(const Config& config) {
     QueryPerformanceFrequency(&freq);
     g_qpc_freq = freq.QuadPart;
 
-    g_and_vtable = hooks::exe_addr(kAndVtableRva);
-    g_or_vtable = hooks::exe_addr(kOrVtableRva);
-    g_not_vtable = hooks::exe_addr(kNotVtableRva);
-    for (const auto& t : cb_cull_triggers::kCountryRef) {
-        g_attacker_only_classes.insert(hooks::exe_addr(t.vtable_rva));
-    }
-    for (const auto& t : cb_cull_triggers::kScalar) {
-        g_attacker_only_classes.insert(hooks::exe_addr(t.vtable_rva));
-    }
     g_scope_ctor = reinterpret_cast<ScopeCtorFn>(hooks::exe_addr(kScopeCtorRva));
 
     uintptr_t original_scan = hooks::exe_addr(kIsAnyCBUsableRva);
@@ -460,9 +436,7 @@ void install_cb_cull(const Config& config) {
             return;  // an already redirected site still behaves correctly
         }
     }
-    logf("cb_cull: active (one scope pair per target, can_use only for live `always` and held types; %zu attacker-only "
-         "trigger classes), profiling %s",
-         g_attacker_only_classes.size(), g_profiling ? "on" : "off");
+    logf("cb_cull: active (pure trees only; fresh scope pair per CanUse), profiling %s", g_profiling ? "on" : "off");
 }
 
 }  // namespace cp::features

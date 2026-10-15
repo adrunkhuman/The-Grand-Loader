@@ -6,6 +6,7 @@
 #include <cstring>
 #include <vector>
 
+#include "features/performance/trigger_safety.h"
 #include "game/world.h"
 #include "hooks/memory.h"
 #include "log.h"
@@ -31,7 +32,9 @@
 // the game, so the results computed before it are dropped and the next chunk is computed afresh. Calls
 // that do not match (nested evaluations, a candidate list changed by an effect) run the original code.
 // MTTH, the draw and Event_Fire stay on the game thread in the original order. Shadow mode (2) answers
-// every call with the original code and compares.
+// every call with the original code and compares. Both modes require the WHOLE listed scan to
+// contain only whitelisted pure trees. The native scan reuses one scope; a boolean-only result
+// cannot replace a trigger that advances its seed, even if that trigger ultimately returns false.
 
 namespace cp::features {
 
@@ -92,6 +95,7 @@ int g_mismatch_logs = 0;
 int64_t g_qpc_freq = 0;
 
 using game::read32;
+inline uint8_t read8(uintptr_t at) { return *reinterpret_cast<const uint8_t*>(at); }
 using game::kWorldProvinces;
 using game::kCountryTag;
 using game::kCountryIndex;
@@ -174,6 +178,7 @@ char __fastcall evaluate_hook(void* self, void*, void* scope) {
         }
         if (found >= limit) {
             g_passthrough++;
+            g_in_scan = false;  // an unlisted evaluation may mutate the shared scope: abandon the batch
             return g_original_evaluate(self, nullptr, scope);
         }
         g_next = found;  // the entries in between are not used
@@ -204,19 +209,22 @@ char __fastcall evaluate_hook(void* self, void*, void* scope) {
     return result;
 }
 
-void add_entry(uintptr_t event, uint32_t key, uint32_t tag) {
+bool add_entry(uintptr_t event, uint32_t key, uint32_t tag) {
     uintptr_t block = event + kEventTrigger;
     uintptr_t vtable = read32(block);
-    if (vtable == g_and_vtable) {
-        *reinterpret_cast<uintptr_t*>(block) = reinterpret_cast<uintptr_t>(g_fake_vtable);
-    } else if (vtable != reinterpret_cast<uintptr_t>(g_fake_vtable)) {
-        return;  // not a plain CAndTrigger block: the scan's call will not reach the hook
+    const trigger_safety::Inspector safety{hooks::exe_base(), read32, read8,
+                                           reinterpret_cast<uintptr_t>(g_fake_vtable)};
+    if ((vtable != g_and_vtable && vtable != reinterpret_cast<uintptr_t>(g_fake_vtable)) ||
+        !safety.pure_tree(block)) {
+        return false;
     }
     g_seq.push_back(Entry{block, key, tag, 0});
+    return true;
 }
 
 // Lists, in the scan's order, every trigger it will evaluate today (as long as nothing changes).
 void __cdecl scan_begin() {
+    g_in_scan = false;
     g_seq.clear();
     g_next = g_ready_end = 0;
     g_fired = 0;
@@ -243,7 +251,9 @@ void __cdecl scan_begin() {
             }
             uintptr_t begin = read32(owner + kCountryEvents), end = read32(owner + kCountryEvents + 4);
             for (uintptr_t it = begin; it < end; it += 4) {
-                add_entry(read32(it), index, read32(c + kCountryTag));
+                if (!add_entry(read32(it), index, read32(c + kCountryTag))) {
+                    return;  // whole scan native; no vtable changes or speculative evaluations yet
+                }
             }
         }
     } else {
@@ -261,9 +271,16 @@ void __cdecl scan_begin() {
             }
             uintptr_t begin = read32(province + kProvinceEvents), end = read32(province + kProvinceEvents + 4);
             for (uintptr_t it = begin; it < end; it += 4) {
-                add_entry(read32(it), static_cast<uint32_t>(p), 0);
+                if (!add_entry(read32(it), static_cast<uint32_t>(p), 0)) {
+                    return;
+                }
             }
         }
+    }
+    // Publish only after every candidate was checked. Vtables left from an earlier eligible scan
+    // pass straight through while g_in_scan is false; fallback never adds a native evaluation.
+    for (const Entry& e : g_seq) {
+        *reinterpret_cast<uintptr_t*>(e.self) = reinterpret_cast<uintptr_t>(g_fake_vtable);
     }
     g_entries += g_seq.size();
     g_in_scan = true;
@@ -369,7 +386,7 @@ void install_events_parallel(const Config& config) {
         logf("parallel_events: scan call site already hooked (tick_profiler?), feature off");
         return;
     }
-    logf("parallel_events: active (%s): the daily event scan's triggers are evaluated on worker threads",
+    logf("parallel_events: active (%s): worker batches only when the entire scan has pure trigger trees",
          g_mode == 2 ? "shadow mode, the game still uses its own evaluation" : "results used");
 }
 

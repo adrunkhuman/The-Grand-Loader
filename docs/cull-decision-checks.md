@@ -11,9 +11,7 @@ Once per AI country per day, `AI_DecisionUpdate` (`0x00821190`) evaluates the `p
 false before they start:
 
 - a decision with a top-level `tag = X`, evaluated for a country other than X (~213 k a day);
-- a decision with a top-level `ai = no`, evaluated for an AI country;
-- a (country, decision) pair whose top-level `NOT = { has_*_flag }` gate already failed, with a flag that
-  nothing clears.
+- a decision with a top-level `ai = no`, evaluated for an AI country.
 
 A hook on each evaluation cannot win: the evaluations cost tens of nanoseconds, about as much as the hook.
 The work has to disappear from the loop.
@@ -24,10 +22,10 @@ The work has to disappear from the loop.
   `0x0081EA9B`) reads the global manager `DAT_01319730`; a wrapper points it at a private copy holding the
   country's lists for the duration of the call. `AI_DiplomacyUpdate`'s two getter calls (`0x0085D34F`,
   `0x0085D459`) get the same lists. The loops run unchanged on fewer entries, in the same order.
-- A list is built by evaluating, for that country, only the direct children of `potential` that were
-  classified once: a `tag` trigger with a literal tag, an `ai` trigger, and a `NOT` block made only of
-  `has_country_flag` / `has_global_flag`.
+- Only decisions with the standard slot 6 and an entirely
+  [pure potential](cull-cb-checks.md#shared-purity-whitelist) may be removed by a failing literal tag
+  or AI gate. Unsupported potentials, including flag predicates, stay in their original positions.
 - Lists are rebuilt when `clr_country_flag` (that country) or `clr_global_flag` runs (hooks on their
   `Execute` vtable slots), when a save is loaded, every 90 game days, and when the decision list changes.
-- `potential` is a short-circuit AND with no side effects, so a decision left out is one the game would
-  have evaluated to false. The player's alert, the UI, `allow`, `ai_will_do` and effects are untouched.
+- A false check can still advance scope RNG and affect later decisions; only pure potentials are
+  culled. The player's alert, the UI, `allow`, `ai_will_do` and effects are untouched.

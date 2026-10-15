@@ -19,12 +19,14 @@ the first day, and hovering a tooltip moves one machine's generator further.
 
 ## How
 
-- The ten call sites that draw from the world generator are redirected to one dispatcher. While the
-  session manager is executing a command (its "executing" flag covers every command, the hourly tick
-  with the whole `DayTick` included) all machines run the same code in the same order, and the draw is
-  taken from the global generator and counted like the game's own draws, so the daily check covers it.
-  Outside command execution (AI frame jobs, tooltips) the draw comes from a private generator seeded
-  from the clock, which no longer matters to anyone else.
-- The world generator itself is left alone; nothing reads it any more.
+- Nine `CALL` sites and the `GetAIRand` tail `JMP` route to one dispatcher. Command execution takes
+  draws from the global, counted generator, except during the intra-day application pump
+  (`0x00685727` -> `0x009DF2B0`), which can update local UI while the executing flag remains set.
+  Pump draws (including nested pumps), AI frame jobs and other draws outside command execution use
+  a private generator seeded from the clock. Installation rolls back if a required site cannot be patched.
+- Private output stays nonnegative, matching native callers' signed-division contract.
+- The world generator itself is left alone; these ten sites no longer consume it.
+- **Needs live multiplayer verification:** run long ticks with different peace/war-goal dialogs open
+  on each peer. The pump exclusion is supported by static inspection, not an in-game reproduction.
 - Single-player results change: the AI's daily timing and diplomatic answers now come from the
   global sequence. Every player of a multiplayer game must use the same value.

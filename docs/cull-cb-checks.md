@@ -2,7 +2,7 @@
 
 ## Source
 
-`patch/src/features/performance/cb_cull.cpp`, class table `patch/src/features/performance/cb_cull_triggers.h`.
+`patch/src/features/performance/cb_cull.cpp`, safety checks in `patch/src/features/performance/trigger_safety.h`.
 Research: [re/systems/casus-belli.md](re/systems/casus-belli.md).
 
 ## Why
@@ -17,12 +17,17 @@ on the attacker (`tag = X`, `civilized = yes`, flags) are re-evaluated for every
 
 - The two AI call sites (`0x0085DCDA`, `0x0085E5FB`) go to a replacement of the loop; the UI, the console,
   the `casus_belli` trigger and war planning keep calling the original.
-- Once per attacker and day, the attacker-only direct children of each type's `can_use` are evaluated; a
-  type with a false one is dead for that attacker for the day. Attacker-only = a trigger class that only
-  reads the scope country, literals or globals, or compares the scope country with a literal tag (194 of
-  236 classes, from decompiling every `Evaluate`), with no `THIS`/`FROM` value; `AND`/`OR`/`NOT` blocks of
-  such children count too.
-- Per target, the two scopes are built once (attacker; `+0x24` -> THIS = defender), then `CanUse` runs for
-  the live `always` types and for the held types that are live, stopping at the first true.
-- The original is an OR over the types with no side effects, so skipping dead types, and the order
-  change, give the same answer.
+- Every real type must have the expected layout, standard `CanUse` and a pure `can_use` tree
+  (see below). Otherwise the whole scan stays native, without a trigger pre-pass.
+- Once per attacker and day, the attacker-only direct children of each eligible type's `can_use` are
+  evaluated; a type with a false one is dead for that attacker for the day.
+- Per target, `CanUse` runs for the live `always` and held types, stopping at the first true. Each call
+  gets fresh scopes (attacker; `+0x24` -> THIS = defender), matching native per-type construction.
+- Skipping and reordering are restricted to pure trees: an `ally` scope check can advance scope RNG
+  even when false (`scope+0x40`, helper `0x009B7910`).
+
+## Shared purity whitelist
+
+Only `AND`/`OR`/`NOT` trees containing `always`, `year`, `month`, `ai` and literal `tag` qualify.
+Native Evaluate slots are checked; unknown classes, context/flag predicates and THIS/FROM tags fall
+back to native evaluation. Coverage is deliberately small, especially for modded trigger trees.

@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "features/performance/trigger_safety.h"
 #include "hooks/hourly_tick.h"
 #include "game/world.h"
 #include "hooks/memory.h"
@@ -34,7 +35,8 @@
 // AI_DiplomacyUpdate the two getter calls are redirected. A country's lists are built once and
 // rebuilt when something can bring a decision back (a flag cleared for that country or globally, a
 // load) or every kRefreshDays to drop the ones that died since. The loops themselves are untouched and
-// the AI pays nothing per decision it no longer sees.
+// the AI pays nothing per decision it no longer sees. Only wholly whitelisted pure potentials may
+// be culled: an earlier failed RNG-consuming check must remain in the native shared-scope loop.
 //
 // decision_profiling swaps the vtable pointer of every decision's `potential` (a CAndTrigger embedded
 // at CDecision+0x24) for a private copy whose Evaluate slot times the call; off, nothing is swapped.
@@ -136,6 +138,7 @@ struct CountryLists {
     int32_t controller = -1;  // world+0xAEC entry at build time: a change flips `ai = yes/no`
     uint32_t version = 0;  // bumped on every build; parallel results are only used for the version they saw
     bool dirty = true;
+    bool parallel_safe = false;  // ALL retained potential/allow/ai_will_do trees are whitelisted
 };
 
 int32_t controller_of(size_t country);
@@ -237,6 +240,12 @@ bool block_is_only_flag_checks(uintptr_t block) {
 
 void classify(DecisionInfo& info) {
     uintptr_t block = info.decision + kDecisionPotential;
+    const trigger_safety::Inspector safety{hooks::exe_base(), read32, read8,
+                                           reinterpret_cast<uintptr_t>(g_fake_vtable)};
+    if (read32(read32(info.decision) + kVtableEvaluate) != hooks::exe_addr(0x631490) ||
+        !safety.pure_tree(block)) {
+        return;  // keep the WHOLE decision, even if a later tag/ai/flag gate would fail
+    }
     for (uintptr_t it = read32(block + kBlockBegin), end = read32(block + kBlockEnd); it < end; it += 4) {
         uintptr_t child = read32(it);
         uintptr_t vtable = read32(child);
@@ -258,6 +267,7 @@ void build_lists(size_t country, int32_t day) {
     int64_t start = qpc();
     lists.a.clear();
     lists.b.clear();
+    lists.parallel_safe = false;
     lists.built_day = day;
     lists.controller = controller_of(country);
     lists.version++;
@@ -272,6 +282,9 @@ void build_lists(size_t country, int32_t day) {
     g_scope_ctor(scope, nullptr, nullptr);
     std::memcpy(scope + kScopeTag, reinterpret_cast<const void*>(object + game::kCountryTag), 8);  // {tag, index}
 
+    const trigger_safety::Inspector safety{hooks::exe_base(), read32, read8,
+                                           reinterpret_cast<uintptr_t>(g_fake_vtable)};
+    lists.parallel_safe = true;
     for (const DecisionInfo& d : g_decisions) {
         if (d.locked_country >= 0 && static_cast<size_t>(d.locked_country) != country) {
             g_removed_tag++;
@@ -286,6 +299,7 @@ void build_lists(size_t country, int32_t day) {
             continue;
         }
         (d.list == 0 ? lists.a : lists.b).push_back(d.decision);
+        lists.parallel_safe = lists.parallel_safe && safety.decision_parallel_safe(d.decision);
     }
     g_list_builds++;
     g_list_build_ticks += static_cast<uint64_t>(qpc() - start);
@@ -347,7 +361,10 @@ __declspec(naked) void getter_stub() {
 // read from the queue, and the worker pool evaluates slot 6, potential and allow of every decision of
 // each country's list with that same scope. During the frame, AI_DecisionUpdate gets a list of only
 // the decisions that passed, in the original order, so ai_will_do, rand() and the command run as before
-// in the game's own code. Shadow mode (2) leaves the game on the full lists and compares instead.
+// in the game's own code. This is allowed only if EVERY retained decision's potential, allow and
+// ai_will_do modifier trees are pure. Otherwise leave the entire country's lists on the serial path,
+// including in shadow mode. No eligibility probe evaluates a trigger. Native order is B then A;
+// the shared seed is 45, and ai_will_do runs between decisions on that same scope.
 
 constexpr uint32_t kCountryAiObject = 0x208;     // CCountry: AI object, 0 for none (AI_FrameUpdate skips those)
 constexpr uint32_t kAiObjectTag = 0x30;
@@ -411,8 +428,8 @@ void precompute_country(int index, void*) {
     make_ai_scope(scope, p.ai);
     p.ok = true;
     for (int which = 0; which < 2 && p.ok; which++) {
-        const std::vector<uintptr_t>& in = which == 0 ? lists.a : lists.b;
-        std::vector<uintptr_t>& out = which == 0 ? p.a : p.b;
+        const std::vector<uintptr_t>& in = which == 0 ? lists.b : lists.a;
+        std::vector<uintptr_t>& out = which == 0 ? p.b : p.a;
         for (uintptr_t decision : in) {
             int r = decision_passes(decision, scope);
             if (r < 0) {
@@ -455,6 +472,9 @@ void frame_begin(void* queue_ref) {
         CountryLists& lists = g_lists[country];
         if (lists_stale(lists, country, day)) {
             build_lists(country, day);  // the same rebuild the AI update would do, done here on the game thread
+        }
+        if (!lists.parallel_safe) {
+            continue;  // country-wide fallback BEFORE any worker/native evaluation, also in shadow mode
         }
         Precomputed& p = g_pre[country];
         p.a.clear();
@@ -502,8 +522,8 @@ void shadow_compare(uint32_t country, uintptr_t ai, const Precomputed& p) {
     alignas(16) unsigned char scope[kScopeSize];
     make_ai_scope(scope, ai);
     for (int which = 0; which < 2; which++) {
-        const std::vector<uintptr_t>& in = which == 0 ? lists.a : lists.b;
-        const std::vector<uintptr_t>& batch = which == 0 ? p.a : p.b;
+        const std::vector<uintptr_t>& in = which == 0 ? lists.b : lists.a;
+        const std::vector<uintptr_t>& batch = which == 0 ? p.b : p.a;
         size_t at = 0;
         for (uintptr_t decision : in) {
             bool in_batch = at < batch.size() && batch[at] == decision;
@@ -955,7 +975,7 @@ void install_decision_cull(const Config& config) {
     logf("decision_cull: active (cull %s: per-country AI lists, rebuilt on flag clears and every %d days; profiling %s)",
          g_cull ? "on" : "off", kRefreshDays, g_profiling ? "on" : "off");
     if (g_parallel) {
-        logf("parallel_decisions: active (%s): decision checks of the AI queue evaluated on worker threads at max speed",
+        logf("parallel_decisions: active (%s): only countries with pure checks AND pure ai_will_do modifiers",
              g_parallel == 2 ? "shadow mode, the game still uses its own evaluation" : "results used");
     }
 }
